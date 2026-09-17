@@ -1,0 +1,238 @@
+118c118
+< constexpr int E = 256;                     // experts
+---
+> constexpr int E = 256;                     // experts the ROUTER scores (global)
+119a120,129
+> // Experts whose weights are resident on THIS rank. Equal to E for a
+> // tensor-parallel build, where every rank holds every expert and shards the
+> // intermediate width instead. Under expert parallelism the router still scores
+> // all E, but only E_LOCAL weight matrices exist here, so every weight index,
+> // TMA descriptor extent and tile owner has to be a local index in [0, E_LOCAL).
+> // The two are kept as separate constants rather than one so a TP build compiles
+> // byte for byte unchanged.
+> constexpr int E_LOCAL = 32;
+> constexpr bool EP_BUILD = (E_LOCAL != E);
+> static_assert(E_LOCAL > 0 && E_LOCAL <= E, "E_LOCAL must be a subset of E");
+122c132
+< constexpr int N_HALF = 256;                 // post-SiLU width, TP=8 shard of 2048
+---
+> constexpr int N_HALF = 2048;                // post-SiLU width, unsharded expert half under EP
+354,358c364,380
+< // per tile: N_HALF/N_FEAT = 12 re-reads. That is evidenced to be affordable
+< // rather than assumed -- Triton's own W+A traffic already implies 4.35/5.02/5.34
+< // TB/s at 3194/6370/12717 tokens against the 4.25 TB/s ceiling, so the arm we
+< // lose to is already having its A re-reads served from cache.
+< static constexpr int A_ROWS = 128;                   // tile height (the knob)
+---
+> // per tile: N_HALF/N_FEAT re-reads, 4 on the TP build and 32 here. That is
+> // evidenced to be affordable rather than assumed -- Triton's own W+A traffic
+> // already implies 4.35/5.02/5.34 TB/s at 3194/6370/12717 tokens against the 4.25
+> // TB/s ceiling, so the arm we lose to is already having its A re-reads served
+> // from cache.
+> //
+> // EP FORCES 64. This is not a tuning choice and it is not free. Under expert
+> // parallelism the expert half is unsharded, so N_HALF is 2048 rather than the
+> // TP=8 shard of 256 and D_KBLK rises 2 -> 16. INTER_SHM = D_KBLK * A_BLK is the
+> // post-SiLU intermediate held in SHM between the up and down phases, and at
+> // A_ROWS=128 that single array is 16 * 16384 = 262144 B, which exceeds the whole
+> // 232448 B SM90 budget before any operand ring is placed. At A_ROWS=64 it is
+> // 131072 B, still 56% of the budget, and the totals below land at 218464 B.
+> // MEASURED cost of giving up the taller tile on this model: -4.91% at 8192 and
+> // -8.35% at 16384 kernel time, recorded when 64 -> 128 was taken on the TP
+> // build. The EP build cannot keep that win.
+> static constexpr int A_ROWS = 64;                    // tile height, capped by EP's D_KBLK=16
+365c387,393
+< static constexpr int UP_PIPE = 4;
+---
+> // 4 on the TP build. A_ROWS=64 alone still leaves SHM_TOTAL at 234880 B, 2432 B
+> // over the cap, so one pipeline depth has to give as well. UP_PIPE is the one
+> // taken rather than A_STAGES because A_STAGES has a hard floor of 3 that this
+> // build is already close to, and because each UP_PIPE stage costs
+> // NUM_WG*B_SHM = 16384 B against A_STAGES' A_BLK = 8192 B, so cutting UP_PIPE
+> // buys twice the headroom per stage surrendered.
+> static constexpr int UP_PIPE = 3;
+943,945c971,973
+<     const float* __restrict__ up_w_scales,   // [E, N_WROW, N_KBLK]
+<     const uint8_t* __restrict__ down_w_fp8,  // [E, H_DIM, N_HALF] e4m3
+<     const float* __restrict__ down_w_scales, // [E, D_WROW, D_KBLK]
+---
+>     const float* __restrict__ up_w_scales,   // [E_LOCAL, N_WROW, N_KBLK]
+>     const uint8_t* __restrict__ down_w_fp8,  // [E_LOCAL, H_DIM, N_HALF] e4m3
+>     const float* __restrict__ down_w_scales, // [E_LOCAL, D_WROW, D_KBLK]
+968c996,1002
+<     float out_scale) {
+---
+>     float out_scale,
+>     // EXPERT PARALLELISM. [NUM_EXPERTS] int32, vLLM's own expert_map: entry g
+>     // holds the local index of global expert g on this rank, or -1 when the
+>     // expert lives elsewhere. Read exactly once per routed slot, in Phase 0.
+>     // Null means every expert is local, which is the tensor-parallel case and
+>     // the only case a non-EP build compiles.
+>     const int32_t* __restrict__ expert_map) {
+1169c1203,1221
+<           topk_ids[t * TOP_K + k] = bidx;
+---
+>           // GLOBAL -> LOCAL, the single point where expert ownership is decided.
+>           // Everything downstream (the histogram, the scan, the counting sort,
+>           // tile ownership, weight indexing, the Phase 3 accumulation) reads
+>           // this slot, so remapping here is what keeps a global id out of every
+>           // local weight index. A slot whose expert lives on another rank is
+>           // stored as -1 and generates no local work; the reference EP path
+>           // reaches the same state by masking those rows out of its sort.
+>           int lidx = bidx;
+>           if constexpr (EP_BUILD) {
+>             lidx = (expert_map != nullptr && bidx >= 0 && bidx < NUM_EXPERTS)
+>                        ? expert_map[bidx]
+>                        : -1;
+>           }
+>           topk_ids[t * TOP_K + k] = lidx;
+>           // The WEIGHT is deliberately still written for an unowned slot, and
+>           // wsum still accumulates it. The model's renormalization denominator
+>           // is the sum over all TOP_K GLOBAL slots, so dropping the unowned
+>           // terms here would rescale the owned ones and every rank would
+>           // disagree with the reference by a different factor.
+1171c1223,1225
+<           atomicAdd(&ws->expert_counts[bidx], 1);  // Phase 1a fused into routing
+---
+>           if (lidx >= 0) {
+>             atomicAdd(&ws->expert_counts[lidx], 1);  // Phase 1a fused into routing
+>           }
+1336a1391,1397
+>     // A slot routed to an expert on another rank has no region to land in and
+>     // no local weight to index. Skipping it here is what makes the sort ragged:
+>     // the per-expert regions are packed back to back over the OWNED rows only,
+>     // exactly the layout Phase 1b's scan already laid out from the histogram.
+>     if constexpr (EP_BUILD) {
+>       if (e < 0) continue;
+>     }
+1415a1477,1494
+>       // OWNERSHIP, re-read here rather than inferred. output_accum is
+>       // deliberately never memset (see the launcher), because the privatized
+>       // down-phase writeback covers every (slot, column) cell before this loop
+>       // reads it. Under EP that invariant does not hold: a slot routed
+>       // elsewhere is covered by no tile, so its cell holds whatever the
+>       // allocator last left there and summing it would poison the token. The
+>       // whole TOP_K row of local ids is one 32 B pair of loads, against the
+>       // 8 x 32 B of partials this loop already reads.
+>       static_assert(!EP_BUILD || TOP_K == 8,
+>                     "the ownership row is read as two int4; TOP_K must be 8");
+>       int4 own[2];
+>       if constexpr (EP_BUILD) {
+>         const int4* own_src =
+>             reinterpret_cast<const int4*>(&topk_ids[(size_t)tok * TOP_K]);
+>         own[0] = own_src[0];
+>         own[1] = own_src[1];
+>       }
+>       const int* own_id = reinterpret_cast<const int*>(own);
+1417a1497,1499
+>         if constexpr (EP_BUILD) {
+>           if (own_id[kp] < 0) continue;
+>         }
+1516a1599,1610
+> // The GLOBAL count above is what the router scores; this is how many expert
+> // weight matrices the binary indexes. They differ only under expert
+> // parallelism. Exporting it is what lets the host gate tell a genuine EP build
+> // apart from a TP build whose weights happen to be the wrong shape: without it
+> // the caller can only mirror the global count and every EP weight tensor looks
+> // like a mismatch.
+> int prefill_wgmma_num_experts_local() { return E_LOCAL; }
+> // The capability marker. 1 means the binary exports
+> // launch_prefill_moe_wgmma_q1_ep and every weight index, TMA extent and tile
+> // owner inside it is a local expert id. A binary without this symbol has no EP
+> // path at all, which the probe reads as None and the gate reads as "decline".
+> int prefill_wgmma_ep_capable() { return EP_BUILD ? 1 : 0; }
+1547c1641,1645
+< int launch_prefill_moe_wgmma_q1_tp2(
+---
+> // _ep2 is the single full-bodied launcher. It is _tp2 plus the expert map, and
+> // the pre-existing _tp2 below is now a forwarder that passes a null map, so
+> // every ABI a previous driver linked against is unchanged and the EP path is a
+> // new symbol rather than a changed one.
+> int launch_prefill_moe_wgmma_q1_ep2(
+1551,1554c1649,1652
+<     const uint8_t* up_w_fp8,       // [E, N_UP, K_DIM] e4m3, pair-interleaved
+<     const float* up_w_scales,      // [E, N_WROW, N_KBLK]
+<     const uint8_t* down_w_fp8,     // [E, H_DIM, N_HALF] e4m3
+<     const float* down_w_scales,    // [E, D_WROW, D_KBLK]
+---
+>     const uint8_t* up_w_fp8,       // [E_LOCAL, N_UP, K_DIM] e4m3, pair-interleaved
+>     const float* up_w_scales,      // [E_LOCAL, N_WROW, N_KBLK]
+>     const uint8_t* down_w_fp8,     // [E_LOCAL, H_DIM, N_HALF] e4m3
+>     const float* down_w_scales,    // [E_LOCAL, D_WROW, D_KBLK]
+1567a1666,1667
+>     const int32_t* expert_map,     // [NUM_EXPERTS] int32 global->local, -1 for
+>                                    // an expert on another rank; null for TP
+1568a1669,1676
+>   // The map and the build have to agree, and this is the last place they can be
+>   // checked. Past the launch there is no fallback: the persistent kernel holds
+>   // every SM and the grid barrier means one wrong rank wedges its peers rather
+>   // than failing alone. An EP build with no map would treat every global id as
+>   // local and index a 32-expert weight tensor with an id up to 255; a TP build
+>   // handed a map would silently ignore it and compute the wrong rank's answer.
+>   if (EP_BUILD && expert_map == nullptr) return -120;
+>   if (!EP_BUILD && expert_map != nullptr) return -121;
+1613c1721,1726
+<     uint64_t gd[2] = {(uint64_t)K_DIM, (uint64_t)E * N_UP};
+---
+>     // E_LOCAL, not E. The descriptor's second extent is the number of ROWS the
+>     // weight tensor actually has, and under EP that tensor holds only this
+>     // rank's experts. Declaring E rows over an E_LOCAL allocation makes every
+>     // coordinate above the boundary a legal TMA address into memory the tensor
+>     // does not own, which is a fault or a wedge rather than a wrong number.
+>     uint64_t gd[2] = {(uint64_t)K_DIM, (uint64_t)E_LOCAL * N_UP};
+1627c1740
+<     uint64_t gd[2] = {(uint64_t)N_HALF, (uint64_t)E * H_DIM};
+---
+>     uint64_t gd[2] = {(uint64_t)N_HALF, (uint64_t)E_LOCAL * H_DIM};
+1675c1788
+<       static_cast<const __nv_bfloat16*>(tp_residual), out_scale);
+---
+>       static_cast<const __nv_bfloat16*>(tp_residual), out_scale, expert_map);
+1681a1795,1841
+> }
+> 
+> // The pre-existing residual entry point, unchanged ABI, forwarding a null
+> // expert map. On a TP build that is the previous binary's behaviour byte for
+> // byte; on an EP build it returns -121 rather than computing a rank's output
+> // from another rank's expert ids.
+> int launch_prefill_moe_wgmma_q1_tp2(
+>     const float* logits, int num_tokens, int block_m,
+>     void* workspace, size_t workspace_bytes,
+>     const void* act_bf16, uint8_t* act_fp8, float* act_scales,
+>     const uint8_t* up_w_fp8, const float* up_w_scales,
+>     const uint8_t* down_w_fp8, const float* down_w_scales,
+>     float* output_accum, int32_t* topk_ids, float* topk_weights,
+>     int32_t* sorted_token_ids, void* bf16_output, const float* router_bias,
+>     void* tp_mc, void* tp_pads, int tp_rank, int tp_world,
+>     int tp_nchunk, int tp_ncomm, uint32_t tp_seq, void* tp_seqctr,
+>     const void* tp_residual, float out_scale,
+>     cudaStream_t stream) {
+>   return launch_prefill_moe_wgmma_q1_ep2(
+>       logits, num_tokens, block_m, workspace, workspace_bytes, act_bf16,
+>       act_fp8, act_scales, up_w_fp8, up_w_scales, down_w_fp8, down_w_scales,
+>       output_accum, topk_ids, topk_weights, sorted_token_ids, bf16_output,
+>       router_bias, tp_mc, tp_pads, tp_rank, tp_world, tp_nchunk, tp_ncomm,
+>       tp_seq, tp_seqctr, tp_residual, out_scale, nullptr, stream);
+> }
+> 
+> // THE EXPERT-PARALLEL ENTRY POINT. The same 17 leading arguments and the same
+> // optional bias slot as every other entry point, then the expert map. It
+> // forwards a null multicast alias and zero communication blocks, so Phase 3
+> // takes the shipped compute loop and the cross-rank reduction stays with the
+> // caller: an EP rank produces a PARTIAL sum over its own experts, which is
+> // exactly what the runner's own all-reduce expects.
+> int launch_prefill_moe_wgmma_q1_ep(
+>     const float* logits, int num_tokens, int block_m,
+>     void* workspace, size_t workspace_bytes,
+>     const void* act_bf16, uint8_t* act_fp8, float* act_scales,
+>     const uint8_t* up_w_fp8, const float* up_w_scales,
+>     const uint8_t* down_w_fp8, const float* down_w_scales,
+>     float* output_accum, int32_t* topk_ids, float* topk_weights,
+>     int32_t* sorted_token_ids, void* bf16_output, const float* router_bias,
+>     const int32_t* expert_map, cudaStream_t stream) {
+>   return launch_prefill_moe_wgmma_q1_ep2(
+>       logits, num_tokens, block_m, workspace, workspace_bytes, act_bf16,
+>       act_fp8, act_scales, up_w_fp8, up_w_scales, down_w_fp8, down_w_scales,
+>       output_accum, topk_ids, topk_weights, sorted_token_ids, bf16_output,
+>       router_bias, nullptr, nullptr, 0, 1, 1, 0, 0u, nullptr, nullptr, 1.0f,
+>       expert_map, stream);

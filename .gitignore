@@ -1,0 +1,25 @@
+# Build output. kernel/build.sh writes here; the .so is rebuildable from source.
+kernel/*/build/
+*.so
+*.o
+*.cubin
+*.ptx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Campaign and profiling output
+*.log
+*.json.gz
+*.nsys-rep
+*.sqlite
+
+# Editor and OS
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

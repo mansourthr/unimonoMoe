@@ -1,0 +1,4171 @@
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 5d63ffa..0fc33f9 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -4237,3 +4237,758 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
+             torch.empty([token_num, q_size], dtype=qkv.dtype, device=qkv.device),
+             torch.empty([token_num, kv_size], dtype=qkv.dtype, device=qkv.device),
+         )
++
++
++# Prefill MoE monokernel: a standalone .so launched via ctypes. The kernel
++# does its own softmax top-k routing and counting-sort, fuses
++# up -> SiLU -> down in a single persistent launch, and consumes the raw
++# block-wise FP8 weights. It refuses to launch above
++# MOE_MONOKERNEL_PREFILL_MAX_TOKENS.
++MOE_MONOKERNEL_PREFILL_MAX_TOKENS = 30720
++_prefill_monokernel_lib = None
++# ids of loaded libraries that export the bias-carrying entry point
++_prefill_monokernel_has_router: set[int] = set()
++
++
++def _load_prefill_monokernel():
++    global _prefill_monokernel_lib
++    if _prefill_monokernel_lib is None:
++        import ctypes
++        import os
++
++        # The binary must be named explicitly. A default path would make "unset"
++        # mean "load whichever build sits there" rather than "no kernel", and a
++        # build is not guaranteed to export the width symbols (n_up, n_half): a
++        # symbol the geometry gate cannot read is skipped rather than treated as
++        # a mismatch, so an unset variable could enable a kernel compiled for a
++        # different intermediate width and index the weights at the wrong
++        # stride. A caller that wants the kernel off sets
++        # VLLM_USE_MOE_MONOKERNEL=0.
++        if not os.environ.get("VLLM_PREFILL_MONOKERNEL_SO"):
++            raise RuntimeError(
++                "VLLM_PREFILL_MONOKERNEL_SO is not set, so no monokernel "
++                "binary has been selected; the compiled geometry of the kernel "
++                "has to be the caller's explicit choice"
++            )
++
++        lib = ctypes.CDLL(envs.VLLM_PREFILL_MONOKERNEL_SO)
++        lib.launch_prefill_moe_wgmma_q1.restype = ctypes.c_int
++        lib.prefill_wgmma_workspace_bytes.restype = ctypes.c_size_t
++        # The bias-carrying entry point is optional. A .so built before the
++        # router work does not export it, and a model whose router has no
++        # correction bias never needs it, so absence is recorded instead of
++        # raising and every existing binary keeps working unchanged.
++        try:
++            lib.launch_prefill_moe_wgmma_q1_router.restype = ctypes.c_int
++            _prefill_monokernel_has_router.add(id(lib))
++        except AttributeError:
++            pass
++        _bind_prefill_monokernel_tp(lib)
++        _prefill_monokernel_lib = lib
++    return _prefill_monokernel_lib
++
++
++# Fused tensor-parallel capability, read off the binary rather than assumed.
++# Each of these answers a question the caller cannot answer for itself: the
++# widest chunk count the binary's pad layout was compiled for, the shard
++# alignment its reduce depends on, the multimem vector width, whether the launch
++# takes the persistent device sequence counter, and the grid the kernel was
++# built for. A .so from before the TP work exports none of them and is recorded
++# as not TP-capable, which is the same answer as an explicit refusal and does
++# not break any existing caller.
++_TP_CAP_SYMBOLS = (
++    "tp_max_c",
++    "tp_has_residual",
++    "tp_align",
++    "tp_mm",
++    "tp_has_devseq",
++    "tp_seq_bytes",
++    "grid_size",
++)
++_prefill_monokernel_tp: dict[int, dict] = {}
++
++
++def _bind_prefill_monokernel_tp(lib) -> None:
++    import ctypes
++
++    caps: dict = {}
++    try:
++        lib.launch_prefill_moe_wgmma_q1_tp.restype = ctypes.c_int
++        caps["has_tp"] = True
++    except AttributeError:
++        caps["has_tp"] = False
++    # The residual entry point is a SEPARATE symbol rather than two extra
++    # arguments on the old one, because the stream pointer is the last argument:
++    # widening _tp in place would make an older binary read the residual pointer
++    # as its stream. Both the symbol and the integer capability below have to be
++    # present, so a partially updated binary is refused rather than half used.
++    try:
++        lib.launch_prefill_moe_wgmma_q1_tp2.restype = ctypes.c_int
++        caps["has_tp2_entry"] = True
++    except AttributeError:
++        caps["has_tp2_entry"] = False
++    for name in _TP_CAP_SYMBOLS:
++        try:
++            fn = getattr(lib, "prefill_wgmma_" + name)
++        except AttributeError:
++            caps[name] = None
++            continue
++        fn.restype = ctypes.c_int
++        caps[name] = fn()
++    # The pad window size is a FUNCTION of the configuration, so the function is
++    # kept rather than one of its values. A caller that recomputes the formula
++    # becomes a second source of truth and the two drift the moment the kernel's
++    # pad layout changes.
++    try:
++        fn = lib.prefill_wgmma_tp_pad_words
++        fn.restype = ctypes.c_int
++        fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
++        caps["pad_words_fn"] = fn
++    except AttributeError:
++        caps["pad_words_fn"] = None
++    _prefill_monokernel_tp[id(lib)] = caps
++
++
++def prefill_monokernel_tp_caps() -> dict:
++    """Fused-TP capability of the loaded binary.
++
++    ``usable`` False means this .so cannot drive the fused collective and every
++    caller must take the ordinary path. It is deliberately the conjunction of
++    everything the fused path dereferences, so a partially updated binary is
++    refused as a whole rather than failing at the launch.
++    """
++    lib = _load_prefill_monokernel()
++    raw = _prefill_monokernel_tp[id(lib)]
++    caps = {k: v for k, v in raw.items() if k != "pad_words_fn"}
++    # Reported separately from usable: a binary that cannot fold still runs the
++    # routed-only epilogue, so this narrows what the fused path does rather than
++    # whether it runs at all.
++    caps["has_tp_residual"] = bool(
++        raw.get("has_tp2_entry") and raw.get("tp_has_residual")
++    )
++    caps["usable"] = bool(
++        raw.get("has_tp")
++        and raw.get("pad_words_fn") is not None
++        and raw.get("tp_max_c")
++        and raw.get("tp_align")
++        and raw.get("grid_size")
++    )
++    return caps
++
++
++def prefill_monokernel_tp_pad_words(nchunk: int, ncomm: int, world: int) -> int:
++    """Barrier pad words the loaded binary needs for this configuration."""
++    lib = _load_prefill_monokernel()
++    fn = _prefill_monokernel_tp[id(lib)].get("pad_words_fn")
++    if fn is None:
++        raise RuntimeError(
++            "loaded monokernel .so does not export prefill_wgmma_tp_pad_words, "
++            "so it cannot drive the fused TP path"
++        )
++    return int(fn(int(nchunk), int(ncomm), int(world)))
++
++
++# Expert geometry is baked into the .so at compile time, so a caller that
++# assumes it cannot notice a mismatch: the kernel would read the wrong bytes of
++# a differently shaped weight tensor and still return 0. Reading the constants
++# back off the binary turns a silent wrong answer into a check. Symbols an
++# older binary lacks are reported as None rather than guessed at.
++_MONOKERNEL_GEOMETRY_SYMBOLS = (
++    "num_experts",
++    # How many expert weight matrices the binary indexes, as opposed to how many
++    # the router scores. The two differ only under expert parallelism, and a
++    # binary that cannot report the local count has no EP path: its weight
++    # indexing is compiled against the global count. Reading it is what lets the
++    # caller tell a genuine EP build apart from a TP build pointed at EP-shaped
++    # weights, which is a wrong-stride read that still returns rc=0.
++    "num_experts_local",
++    # 1 when launch_prefill_moe_wgmma_q1_ep exists and every weight index, TMA
++    # extent and tile owner inside the kernel is a local expert id.
++    "ep_capable",
++    "top_k",
++    "k_dim",
++    "h_dim",
++    "n_up",
++    "n_half",
++    "router_mode",
++    "max_tiles",
++    "grid_size",
++    "fused_renorm",
++)
++
++
++_prefill_fused_renorm_cache: dict = {}
++
++
++def _prefill_fused_renorm(lib) -> bool:
++    """True when the loaded monokernel applies the router renorm itself.
++
++    Cached because this sits on the per-layer path. A binary without the symbol
++    answers False, which is the pre-fusion behaviour.
++    """
++    import ctypes
++
++    key = id(lib)
++    if key not in _prefill_fused_renorm_cache:
++        try:
++            fn = lib.prefill_wgmma_fused_renorm
++        except AttributeError:
++            _prefill_fused_renorm_cache[key] = False
++        else:
++            fn.restype = ctypes.c_int
++            _prefill_fused_renorm_cache[key] = bool(fn())
++    return _prefill_fused_renorm_cache[key]
++
++
++def prefill_monokernel_geometry() -> dict:
++    """Return the expert geometry the loaded monokernel .so was built for."""
++    import ctypes
++
++    lib = _load_prefill_monokernel()
++    geo = {}
++    for name in _MONOKERNEL_GEOMETRY_SYMBOLS:
++        try:
++            fn = getattr(lib, "prefill_wgmma_" + name)
++        except AttributeError:
++            geo[name] = None
++            continue
++        fn.restype = ctypes.c_int
++        geo[name] = int(fn())
++    geo["has_router_entry"] = id(lib) in _prefill_monokernel_has_router
++    return geo
++
++
++def monokernel_validate(
++    activations_in: torch.Tensor,
++    expert_weights_up: torch.Tensor,
++    expert_weights_down: torch.Tensor,
++    top_k: int,
++    e_score_correction_bias: torch.Tensor | None,
++    expert_map: torch.Tensor | None = None,
++) -> torch.Tensor | None:
++    """Check the loaded .so against these weights and return the bias to use.
++
++    Called by moe_monokernel_prefill and by the caller-side wrapper fix, which
++    replaces that function's body. Both go through here so the two cannot
++    disagree about which launches are legal.
++
++    Every field is compared because the kernel indexes its weights from
++    compile-time constants: a shape it was not built for is read at the wrong
++    stride and still returns rc=0, so an unchecked mismatch is a wrong answer
++    rather than a failure. Symbols an older binary does not export come back
++    None and are skipped rather than guessed at.
++    """
++    geo = prefill_monokernel_geometry()
++    n_up_built, n_half_built = geo.get("n_up"), geo.get("n_half")
++    w13_n, w2_n = expert_weights_up.size(1), expert_weights_down.size(2)
++    if n_up_built is not None and n_up_built != w13_n:
++        raise RuntimeError(
++            f"monokernel built for N_UP={n_up_built} but w13 has {w13_n}"
++        )
++    if n_half_built is not None and n_half_built != w2_n:
++        raise RuntimeError(
++            f"monokernel built for N_HALF={n_half_built} but w2 has {w2_n}"
++        )
++    if geo.get("k_dim") not in (None, activations_in.size(1)):
++        raise RuntimeError(
++            f"monokernel built for K_DIM={geo['k_dim']} but activations have "
++            f"{activations_in.size(1)}"
++        )
++    # EXPERT COUNTS. There are two of them and they are checked separately,
++    # because under expert parallelism the router scores every global expert
++    # while only this rank's slabs exist locally. num_experts is the routing
++    # width; num_experts_local is the number of weight slabs the kernel indexes.
++    # A binary that does not export the local count has no EP path at all, so
++    # the local count IS the global count there and an EP-shaped weight tensor
++    # has to be refused rather than read at the wrong stride.
++    n_e_built = geo.get("num_experts")
++    n_local_built = geo.get("num_experts_local")
++    if n_local_built is None:
++        n_local_built = n_e_built
++    n_local_got = expert_weights_up.size(0)
++    if n_local_built is not None and n_local_built != n_local_got:
++        raise RuntimeError(
++            f"monokernel built to index {n_local_built} local expert slabs but "
++            f"got {n_local_got}"
++        )
++    if expert_map is None:
++        # No map means every routed expert must be local, which is only true when
++        # the two counts coincide.
++        if n_e_built is not None and n_e_built != n_local_got:
++            raise RuntimeError(
++                f"monokernel built for E={n_e_built} but got {n_local_got} "
++                "experts and no expert_map to remap them"
++            )
++    else:
++        if not bool(geo.get("ep_capable")):
++            raise RuntimeError(
++                "an expert_map was supplied but the loaded monokernel .so is "
++                "not EP capable (no launch_prefill_moe_wgmma_q1_ep); its weight "
++                "indexing would use global expert ids"
++            )
++        if expert_map.dtype != torch.int32:
++            raise RuntimeError(f"expert_map must be int32, got {expert_map.dtype}")
++        if n_e_built is not None and expert_map.numel() != n_e_built:
++            raise RuntimeError(
++                f"monokernel built for E={n_e_built} but expert_map has "
++                f"{expert_map.numel()} entries"
++            )
++    if geo.get("top_k") not in (None, int(top_k)):
++        raise RuntimeError(
++            f"monokernel built for TOP_K={geo['top_k']} but got top_k={top_k}"
++        )
++
++    # A correction bias only means anything to a sigmoid build. Silently
++    # dropping it would produce a plausible number from the wrong experts.
++    bias = e_score_correction_bias
++    if bias is not None:
++        if geo.get("router_mode") == 0:
++            raise RuntimeError(
++                "monokernel .so is a softmax (ROUTER_MODE 0) build and cannot "
++                "apply an e_score_correction_bias"
++            )
++        if not geo.get("has_router_entry"):
++            raise RuntimeError(
++                "monokernel .so does not export "
++                "launch_prefill_moe_wgmma_q1_router, so a correction bias "
++                "cannot be passed"
++            )
++        return bias.float().contiguous()
++
++    if geo.get("router_mode") not in (None, 0):
++        # The reverse mistake: a sigmoid build reached with no bias would score
++        # every expert unbiased, which is not the model's routing either.
++        raise RuntimeError(
++            f"monokernel .so is a ROUTER_MODE {geo['router_mode']} (sigmoid) "
++            "build but no e_score_correction_bias was supplied"
++        )
++    return None
++
++
++def _moe_monokernel_prefill_impl(
++    activations_in: torch.Tensor,
++    router_logits: torch.Tensor,
++    expert_weights_up: torch.Tensor,
++    expert_scales_up: torch.Tensor,
++    expert_weights_down: torch.Tensor,
++    expert_scales_down: torch.Tensor,
++    top_k: int,
++    renormalize: bool,
++    e_score_correction_bias: torch.Tensor | None,
++    out: torch.Tensor,
++    tp: tuple | None = None,
++    # The shared-expert half, folded into the epilogue so the single fused
++    # collective carries out_scale*routed + residual instead of the routed half
++    # alone. Null means the shipped store, and out_scale 1.0f is exact in fp32,
++    # so an unfolded call is bit for bit what it was.
++    residual: torch.Tensor | None = None,
++    out_scale: float = 1.0,
++    # EXPERT PARALLELISM. vLLM's own expert_map, int32 [global_num_experts]:
++    # entry g is the local slot of global expert g on this rank, or -1 when that
++    # expert lives on another rank. Passing it selects the EP entry point, where
++    # the kernel remaps every routed slot once during routing and generates no
++    # local work for an unowned one. The result is a PARTIAL sum over this
++    # rank's experts, which is what the caller's own all-reduce expects.
++    expert_map: torch.Tensor | None = None,
++) -> None:
++    """Prefill MoE monokernel for block-wise FP8 experts.
++
++    The kernel routes internally, so the scoring function is a property of the
++    binary rather than of this call: a ROUTER_MODE 0 build takes softmax over
++    the logits, and a mode 1 or 2 build takes sigmoid scores with the optional
++    per-expert correction bias added for SELECTION ONLY, the weight staying the
++    unbiased score. Passing a bias to a mode 0 build would therefore be
++    silently ignored, so it is refused instead.
++
++    Router weights are returned unnormalized; when renormalize is set the top-k
++    weights are divided by their per-token sum, which is exact algebra on the
++    weighted output.
++    """
++    import ctypes
++
++    lib = _load_prefill_monokernel()
++
++    M, K = activations_in.shape
++    H = expert_weights_down.size(1)
++    top_k = int(top_k)
++    n_kblk = K // 128
++    device = activations_in.device
++
++    act = activations_in.contiguous()
++    logits = router_logits.float().contiguous()
++    w_up = expert_weights_up.contiguous().view(torch.uint8)
++    w_down = expert_weights_down.contiguous().view(torch.uint8)
++    s_up = expert_scales_up.float().contiguous()
++    s_down = expert_scales_down.float().contiguous()
++
++    emap = None
++    if expert_map is not None:
++        if tp is not None:
++            # EP and the fused TP collective are mutually exclusive in vLLM's own
++            # parallel config (EP sets the MoE tp_size to 1), so a call that asks
++            # for both is a caller bug, not a configuration to accommodate.
++            raise RuntimeError(
++                "the fused TP collective and an expert_map cannot be combined; "
++                "an EP rank's output is reduced by the caller"
++            )
++        emap = expert_map.to(torch.int32).contiguous()
++
++    bias = monokernel_validate(
++        activations_in,
++        expert_weights_up,
++        expert_weights_down,
++        top_k,
++        e_score_correction_bias,
++        emap,
++    )
++
++    ws_bytes = lib.prefill_wgmma_workspace_bytes()
++    workspace = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
++    act_fp8 = torch.empty(M, K, dtype=torch.uint8, device=device)
++    act_scales = torch.empty(M, n_kblk, dtype=torch.float32, device=device)
++    topk_ids = torch.empty(M, top_k, dtype=torch.int32, device=device)
++    topk_weights = torch.empty(M, top_k, dtype=torch.float32, device=device)
++    sorted_ids = torch.empty(M * top_k, dtype=torch.int32, device=device)
++    output_accum = torch.empty(M * top_k, H, dtype=torch.float32, device=device)
++    if out.shape != (M, H) or out.dtype != torch.bfloat16:
++        raise RuntimeError(
++            f"monokernel destination must be [{M}, {H}] bfloat16, got "
++            f"{tuple(out.shape)} {out.dtype}"
++        )
++
++    stream = torch.cuda.current_stream().cuda_stream
++    # Same argument list either way; the router entry point takes one extra
++    # bias pointer just before the stream.
++    # The fused TP entry point takes the SAME 17 leading arguments and the same
++    # optional bias slot; everything the collective needs follows. It is used
++    # only when the caller supplies a fused configuration, so a caller that
++    # passes none gets byte-identical behaviour to before this change.
++    resid_ptr = 0
++    if residual is not None:
++        if residual.shape != (M, H) or residual.dtype != torch.bfloat16:
++            raise RuntimeError(
++                f"monokernel folded residual must be [{M}, {H}] bfloat16, got "
++                f"{tuple(residual.shape)} {residual.dtype}"
++            )
++        if not residual.is_contiguous():
++            raise RuntimeError("monokernel folded residual must be contiguous")
++        if tp is None:
++            raise RuntimeError(
++                "a folded residual is only carried by the fused collective; "
++                "without a TP configuration there is nothing to fold it into"
++            )
++        resid_ptr = residual.data_ptr()
++    fold = resid_ptr != 0 or float(out_scale) != 1.0
++    if fold and not _prefill_monokernel_tp[id(lib)].get("has_tp2_entry"):
++        raise RuntimeError(
++            "loaded monokernel .so has no launch_prefill_moe_wgmma_q1_tp2, so "
++            "it cannot fold a residual or apply an output scale"
++        )
++    if tp is not None:
++        entry = (
++            lib.launch_prefill_moe_wgmma_q1_tp2
++            if fold
++            else lib.launch_prefill_moe_wgmma_q1_tp
++        )
++    elif emap is not None:
++        # The EP entry point takes the bias slot unconditionally, then the map.
++        # It is a distinct symbol rather than a flag on an existing one, so a
++        # binary without an EP path raises AttributeError here instead of being
++        # handed a pointer it would ignore.
++        entry = lib.launch_prefill_moe_wgmma_q1_ep
++    else:
++        entry = (
++            lib.launch_prefill_moe_wgmma_q1_router
++            if bias is not None
++            else lib.launch_prefill_moe_wgmma_q1
++        )
++    rc = entry(
++        ctypes.c_void_p(logits.data_ptr()),
++        ctypes.c_int(M),
++        ctypes.c_int(64),
++        ctypes.c_void_p(workspace.data_ptr()),
++        ctypes.c_size_t(ws_bytes),
++        ctypes.c_void_p(act.data_ptr()),
++        ctypes.c_void_p(act_fp8.data_ptr()),
++        ctypes.c_void_p(act_scales.data_ptr()),
++        ctypes.c_void_p(w_up.data_ptr()),
++        ctypes.c_void_p(s_up.data_ptr()),
++        ctypes.c_void_p(w_down.data_ptr()),
++        ctypes.c_void_p(s_down.data_ptr()),
++        ctypes.c_void_p(output_accum.data_ptr()),
++        ctypes.c_void_p(topk_ids.data_ptr()),
++        ctypes.c_void_p(topk_weights.data_ptr()),
++        ctypes.c_void_p(sorted_ids.data_ptr()),
++        ctypes.c_void_p(out.data_ptr()),
++        *(
++            # The fused and EP entry points take the bias slot unconditionally,
++            # so a bias-free model passes an explicit null rather than omitting
++            # it.
++            (ctypes.c_void_p(bias.data_ptr() if bias is not None else 0),)
++            if tp is not None or emap is not None
++            else (ctypes.c_void_p(bias.data_ptr()),)
++            if bias is not None
++            else ()
++        ),
++        *(
++            _tp2_launch_args(tp, resid_ptr, out_scale)
++            if tp is not None and fold
++            else _tp_launch_args(tp)
++            if tp is not None
++            else (ctypes.c_void_p(emap.data_ptr()),)
++            if emap is not None
++            else ()
++        ),
++        ctypes.c_void_p(stream),
++    )
++    if rc != 0:
++        raise RuntimeError(f"launch_prefill_moe_wgmma_q1 failed: rc={rc}")
++
++    # Who owns the router renormalization is a property of the BINARY, not of
++    # this call. A fused build has already divided each row inside Phase 3, in
++    # fp32 before the single round to bf16; dividing again here would scale
++    # every row twice and produce a quietly wrong answer rather than a crash.
++    fused = _prefill_fused_renorm(lib)
++    if renormalize and not fused:
++        denom = topk_weights.sum(1, keepdim=True).clamp(min=1e-30)
++        out.div_(denom.to(out.dtype))
++    elif fused and not renormalize:
++        # The normalization is baked into the binary and cannot be undone from
++        # here, so returning normalized rows for an unnormalized request would
++        # be an invisible wrong answer. Refuse instead.
++        raise RuntimeError(
++            "monokernel .so is a FUSED_RENORM build but renormalize=False was "
++            "requested; the in-kernel normalization cannot be undone"
++        )
++
++
++def _tp2_launch_args(tp: tuple, residual_ptr: int, out_scale: float) -> tuple:
++    """The residual entry point's arguments, in the order it takes them.
++
++    tp is (mc_ptr, pads_ptr, seqctr_ptr, rank, world, nchunk, ncomm).
++
++    Unlike _tp_launch_args this ALWAYS emits the sequence-counter slot, even
++    when it is null. There it was optional because it was the last argument
++    before the stream; here two arguments follow it, so omitting it would slide
++    the residual pointer into its place.
++    """
++    import ctypes
++
++    mc, pads, seqctr, rank, world, nchunk, ncomm = tp
++    return (
++        ctypes.c_void_p(int(mc)),
++        ctypes.c_void_p(int(pads)),
++        ctypes.c_int(int(rank)),
++        ctypes.c_int(int(world)),
++        ctypes.c_int(int(nchunk)),
++        ctypes.c_int(int(ncomm)),
++        ctypes.c_uint(0),
++        ctypes.c_void_p(int(seqctr)),
++        ctypes.c_void_p(int(residual_ptr)),
++        ctypes.c_float(float(out_scale)),
++    )
++
++
++def _tp_launch_args(tp: tuple) -> tuple:
++    """The fused collective's arguments, in the order the entry point takes them.
++
++    tp is (mc_ptr, pads_ptr, seqctr_ptr, rank, world, nchunk, ncomm).
++
++    The host sequence value is passed as 0 and superseded by the device counter
++    whenever the binary exports one: a host counter is baked into a CUDA graph
++    and replays the same value, which is the whole reason the device counter
++    exists. A binary without it keeps the old argument path and is refused for
++    graph use by the caller instead of being handed a value that cannot work.
++    """
++    import ctypes
++
++    mc, pads, seqctr, rank, world, nchunk, ncomm = tp
++    args = (
++        ctypes.c_void_p(int(mc)),
++        ctypes.c_void_p(int(pads)),
++        ctypes.c_int(int(rank)),
++        ctypes.c_int(int(world)),
++        ctypes.c_int(int(nchunk)),
++        ctypes.c_int(int(ncomm)),
++        ctypes.c_uint(0),
++    )
++    if seqctr:
++        args = args + (ctypes.c_void_p(int(seqctr)),)
++    return args
++
++
++def moe_monokernel_prefill(
++    activations_in: torch.Tensor,
++    router_logits: torch.Tensor,
++    expert_weights_up: torch.Tensor,
++    expert_scales_up: torch.Tensor,
++    expert_weights_down: torch.Tensor,
++    expert_scales_down: torch.Tensor,
++    top_k: int = 8,
++    renormalize: bool = True,
++    e_score_correction_bias: torch.Tensor | None = None,
++    expert_map: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Allocating variant. This one really does return a fresh tensor, so the
++    functional registration below is true of it.
++
++    expert_map is vLLM's own int32 global->local map, or None for the
++    tensor-parallel case where every expert is local. Under EP the returned
++    tensor is this rank's PARTIAL sum and the caller still owns the reduce.
++    """
++    M = activations_in.size(0)
++    H = expert_weights_down.size(1)
++    out = torch.empty(M, H, dtype=torch.bfloat16, device=activations_in.device)
++    _moe_monokernel_prefill_impl(
++        activations_in,
++        router_logits,
++        expert_weights_up,
++        expert_scales_up,
++        expert_weights_down,
++        expert_scales_down,
++        top_k,
++        renormalize,
++        e_score_correction_bias,
++        out,
++        None,
++        None,
++        1.0,
++        expert_map,
++    )
++    return out
++
++
++def moe_monokernel_prefill_out(
++    activations_in: torch.Tensor,
++    router_logits: torch.Tensor,
++    expert_weights_up: torch.Tensor,
++    expert_scales_up: torch.Tensor,
++    expert_weights_down: torch.Tensor,
++    expert_scales_down: torch.Tensor,
++    out: torch.Tensor,
++    top_k: int = 8,
++    renormalize: bool = True,
++    e_score_correction_bias: torch.Tensor | None = None,
++    tp_mc_ptr: int = 0,
++    tp_pads_ptr: int = 0,
++    tp_seqctr_ptr: int = 0,
++    tp_rank: int = 0,
++    tp_world: int = 1,
++    tp_nchunk: int = 0,
++    tp_ncomm: int = 0,
++    tp_residual: torch.Tensor | None = None,
++    tp_out_scale: float = 1.0,
++) -> None:
++    """Write the MoE result into a caller-supplied destination.
++
++    This is the variant the fused path uses, and it exists because that path's
++    destination is a persistent symmetric buffer rather than a fresh
++    allocation. Declaring the write (mutates_args=("out",)) is what makes
++    repeated calls on the same buffer ordered and non-eliminable; the functional
++    variant above would have claimed each call produced an independent tensor.
++
++    A non-zero tp_ncomm selects the fused collective, in which case out MUST be
++    the symmetric window that tp_mc_ptr aliases. Passing tp_ncomm == 0 runs the
++    ordinary kernel and leaves the reduction to the caller.
++    """
++    tp = None
++    if tp_ncomm > 0:
++        if not (tp_mc_ptr and tp_pads_ptr):
++            raise RuntimeError(
++                "fused TP launch requires both a multicast pointer and a "
++                "barrier pad pointer"
++            )
++        tp = (
++            tp_mc_ptr,
++            tp_pads_ptr,
++            tp_seqctr_ptr,
++            tp_rank,
++            tp_world,
++            tp_nchunk,
++            tp_ncomm,
++        )
++    _moe_monokernel_prefill_impl(
++        activations_in,
++        router_logits,
++        expert_weights_up,
++        expert_scales_up,
++        expert_weights_down,
++        expert_scales_down,
++        top_k,
++        renormalize,
++        e_score_correction_bias,
++        out,
++        tp,
++        tp_residual,
++        tp_out_scale,
++    )
++
++
++def moe_monokernel_prefill_out_fake(
++    activations_in: torch.Tensor,
++    router_logits: torch.Tensor,
++    expert_weights_up: torch.Tensor,
++    expert_scales_up: torch.Tensor,
++    expert_weights_down: torch.Tensor,
++    expert_scales_down: torch.Tensor,
++    out: torch.Tensor,
++    top_k: int = 8,
++    renormalize: bool = True,
++    e_score_correction_bias: torch.Tensor | None = None,
++    tp_mc_ptr: int = 0,
++    tp_pads_ptr: int = 0,
++    tp_seqctr_ptr: int = 0,
++    tp_rank: int = 0,
++    tp_world: int = 1,
++    tp_nchunk: int = 0,
++    tp_ncomm: int = 0,
++    tp_residual: torch.Tensor | None = None,
++    tp_out_scale: float = 1.0,
++) -> None:
++    # Nothing to allocate and nothing to return: the destination is an input and
++    # the only effect the compiler needs to know about is that it was written.
++    return None
++
++
++def moe_monokernel_prefill_fake(
++    activations_in: torch.Tensor,
++    router_logits: torch.Tensor,
++    expert_weights_up: torch.Tensor,
++    expert_scales_up: torch.Tensor,
++    expert_weights_down: torch.Tensor,
++    expert_scales_down: torch.Tensor,
++    top_k: int = 8,
++    renormalize: bool = True,
++    e_score_correction_bias: torch.Tensor | None = None,
++    expert_map: torch.Tensor | None = None,
++) -> torch.Tensor:
++    M = activations_in.size(0)
++    H = expert_weights_down.size(1)
++    return torch.empty((M, H), dtype=torch.bfloat16, device=activations_in.device)
++
++
++# direct_register_custom_op lives in vllm.utils.torch_utils and is not imported
++# at the top of this module upstream, so it is pulled in here at the point of use.
++from vllm.utils.torch_utils import (  # noqa: E402
++    direct_register_custom_op as _direct_register_custom_op,
++)
++
++_direct_register_custom_op(
++    op_name="moe_monokernel_prefill",
++    op_func=moe_monokernel_prefill,
++    mutates_args=[],
++    fake_impl=moe_monokernel_prefill_fake,
++)
++
++# The mutating variant. mutates_args=("out",) is the whole point: it is what
++# tells the compiler the op writes a tensor it was handed, so two calls that
++# share a destination are ordered by that tensor and neither can be dropped or
++# hoisted past the other. Registering the fused path as functional and relying
++# on stream order to keep the reuse honest would have been an undocumented
++# assumption, which is exactly what this avoids.
++_direct_register_custom_op(
++    op_name="moe_monokernel_prefill_out",
++    op_func=moe_monokernel_prefill_out,
++    mutates_args=("out",),
++    fake_impl=moe_monokernel_prefill_out_fake,
++)
+diff --git a/vllm/distributed/device_communicators/all2all.py b/vllm/distributed/device_communicators/all2all.py
+index 5abe756..0446265 100644
+--- a/vllm/distributed/device_communicators/all2all.py
++++ b/vllm/distributed/device_communicators/all2all.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import threading
+ from dataclasses import dataclass
+ from typing import Any
+@@ -168,7 +169,14 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
+ 
+         # This is the DeepEP default. Stick to it till we can establish
+         # reasonable defaults based on profiling.
+-        self.num_sms = 20
++        #
++        # VLLM_EP_NUM_SMS overrides it. Measured with real DS3 routing on 8xH200:
++        # at 20 SMs the intranode combine reaches only 38.0% of the 478.125 GB/s
++        # NVLink per-direction peak and keeps improving to ~48.6% near 80-96 SMs.
++        # The intranode buffer is sized by VLLM_DEEPEP_BUFFER_SIZE_MB, not by
++        # num_sms, so raising this costs no memory.
++        self.num_sms = int(os.environ.get("VLLM_EP_NUM_SMS", "20"))
++        assert self.num_sms % 2 == 0, "DeepEP requires an even SM count"
+ 
+     def get_handle(self, kwargs):
+         raise NotImplementedError
+@@ -252,6 +260,16 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
+ 
+         buffer_kwargs = self._make_all2all_kwargs()
+         logger.debug("DeepEP all2all args %s", buffer_kwargs)
++        # Must precede construction: the Buffer's per-channel structures are laid
++        # out from deep_ep.Buffer.num_sms at construction time. Logged
++        # unconditionally so every arm of a sweep carries a positive record of the
++        # count it ran at, including the arm that matches the default.
++        deep_ep.Buffer.set_num_sms(self.num_sms)
++        logger.info(
++            "DeepEP HT comm SMs set to %d (%d channels)",
++            self.num_sms,
++            self.num_sms // 2,
++        )
+         handle: deep_ep.Buffer = self.handle_cache.get_or_create(
+             buffer_kwargs, deep_ep.Buffer
+         )
+diff --git a/vllm/envs.py b/vllm/envs.py
+index ed62659..408964a 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -173,6 +173,9 @@ if TYPE_CHECKING:
+     VLLM_DP_RANK_LOCAL: int = -1
+     VLLM_DP_SIZE: int = 1
+     VLLM_USE_STANDALONE_COMPILE: bool = True
++    VLLM_USE_MOE_MONOKERNEL: bool = True
++    VLLM_PREFILL_MONOKERNEL_SO: str = ""
++    VLLM_PREFILL_MONOKERNEL_TP_FUSE: bool = False
+     VLLM_ENABLE_PREGRAD_PASSES: bool = True
+     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
+     VLLM_DP_MASTER_IP: str = ""
+@@ -601,6 +604,28 @@ def _resolve_rust_cli_path() -> str | None:
+ 
+ 
+ environment_variables: dict[str, Callable[[], Any]] = {
++    # Enable the MoE monokernel fast path (prefill FP8 block-wise
++    # E=256/N=1024/K=2048). Set to 0 to force the standard TRITON
++    # fused-MoE backend for A/B benchmarking.
++    "VLLM_USE_MOE_MONOKERNEL": lambda: bool(
++        int(os.getenv("VLLM_USE_MOE_MONOKERNEL", "1"))
++    ),
++    # Path to the prefill MoE monokernel shared library
++    # (libprefill_mono.so, exporting launch_prefill_moe_wgmma_q1).
++    #
++    # Empty by default, deliberately. A default path here would make an unset
++    # variable mean "load whichever build happens to sit at that path" rather
++    # than "no kernel", and a build compiled for another model's geometry that
++    # exports no width symbols can pass the geometry gate and then fault. The
++    # loader refuses an empty path; the off switch is VLLM_USE_MOE_MONOKERNEL=0.
++    "VLLM_PREFILL_MONOKERNEL_SO": lambda: os.getenv("VLLM_PREFILL_MONOKERNEL_SO", ""),
++    # Let the prefill monokernel release the tensor-parallel reduction from
++    # inside its own epilogue instead of leaving it to the external all-reduce.
++    # Off by default: the fused epilogue is a collective, so enabling it changes
++    # what every rank in the TP group must do.
++    "VLLM_PREFILL_MONOKERNEL_TP_FUSE": lambda: bool(
++        int(os.getenv("VLLM_PREFILL_MONOKERNEL_TP_FUSE", "0"))
++    ),
+     # ================== Installation Time Env Vars ==================
+     # Target device of vLLM, supporting [cuda (by default),
+     # rocm, cpu]
+diff --git a/vllm/model_executor/layers/fused_moe/_ep_timer.py b/vllm/model_executor/layers/fused_moe/_ep_timer.py
+new file mode 100644
+index 0000000..56125de
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/_ep_timer.py
+@@ -0,0 +1,686 @@
++"""Per phase CUDA event timing for the EP MoE path, off unless enabled.
++
++Set VLLM_EP_TIME_DUMP to an output prefix. Each rank writes
++<prefix>.rank<N>.json at process exit. No synchronization happens in the hot
++path: events are only recorded, and elapsed_time is read once at exit after a
++device synchronize, so the measurement does not change the schedule it
++measures.
++
++Phases recorded: "route" (expert selection and metadata), "layer" (the whole
++routed expert call), "dispatch" (the all2all dispatch), "combine" (the all2all
++combine). Expert compute is layer minus dispatch minus combine.
++
++Every call is kept in order rather than pooled, because the engine runs dummy
++profile passes before the real prefill and pooling them together corrupts the
++statistics. The reader chunks the ordered list by the MoE layer count to
++recover per pass numbers.
++
++Only valid under eager execution: events recorded inside a captured CUDA graph
++do not carry per replay timings.
++"""
++
++import contextlib
++import os
++
++_ON = os.environ.get("VLLM_EP_TIME_DUMP", "")
++_spans: list = []
++
++
++class _Span:
++    __slots__ = ("tag", "layer", "s", "e")
++
++    def __init__(self, tag, layer, s, e):
++        self.tag = tag
++        self.layer = layer
++        self.s = s
++        self.e = e
++
++
++class _Rec:
++    """Context manager that brackets a region with two CUDA events."""
++
++    __slots__ = ("tag", "layer", "s", "e")
++
++    def __init__(self, tag, layer):
++        self.tag = tag
++        self.layer = layer
++
++    def __enter__(self):
++        import torch
++
++        self.s = torch.cuda.Event(enable_timing=True)
++        self.e = torch.cuda.Event(enable_timing=True)
++        self.s.record()
++        return self
++
++    def __exit__(self, *exc):
++        self.e.record()
++        _spans.append(_Span(self.tag, self.layer, self.s, self.e))
++        return False
++
++
++class _Null:
++    __slots__ = ()
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        return False
++
++
++# The disabled-path no-op MUST be contextlib.nullcontext, not the _Null instance
++# above. _Null is correct at runtime but Dynamo cannot enter a user-defined context
++# manager, and under cudagraph_mode FULL_AND_PIECEWISE the model is traced with
++# aot_compile / fullgraph_capture, which cannot absorb the resulting graph break.
++# That killed all 8 ranks in profile_run via moe_runner.py's `with span(...)`
++# regions. PIECEWISE only graph-breaks, which is why the EP campaign never saw it.
++# nullcontext has a Dynamo variable tracker.
++_NULL = contextlib.nullcontext()
++
++
++_installed = False
++_RSCTL = os.environ.get("VLLM_EP_RS_CONTROL", "") == "1"
++_SYNCDEEP = os.environ.get("VLLM_EP_DEEPEP_SYNC", "") == "1"
++_COMBBAR = os.environ.get("VLLM_EP_COMB_BARRIER", "") == "1"
++_PHASE2 = os.environ.get("VLLM_EP_PHASE2", "") == "1"
++_ctl: dict = {}
++
++
++def _rs_controls(comm, t):
++    """Two controls for the combine reduce-scatter, measured in place.
++
++    The engine's combine costs 787.3 us/layer at 8192 tokens while the SAME
++    reduce-scatter of the SAME 117.44 MB bf16 buffer costs 332.3 us on a bare
++    8 rank process group. Something in the engine path, not the hardware, is
++    paying 2.37x. These two controls separate the two candidate causes without
++    guessing, both issued from inside the real forward, immediately before the
++    real collective, on the same 8 GPUs:
++
++      rs_ctl_tiny   a 64 row reduce_scatter on the SAME pynccl comm, issued
++                    FIRST. Its transfer is ~4 KB, three orders of magnitude
++                    below the real combine, so any large time it reports cannot
++                    be bytes: it is the wait that the first collective at this
++                    point in the layer absorbs, whether that is late rank
++                    arrival or the expert GEMM tail still draining the stream.
++      rs_ctl_pcp    the same pynccl comm this communicator already holds, but
++                    on persistent pre-allocated contiguous scratch. If this is
++                    fast, the cost is in the BUFFER the engine hands over
++                    (allocation, contiguity, or the output torch.empty) and is
++                    fixable in the caller.
++      rs_ctl_world  torch's default process group, which at TP=1/PCP=8 spans
++                    exactly the same 8 ranks but is a DIFFERENT NCCL
++                    communicator. If this is fast while rs_ctl_pcp is slow, the
++                    cost belongs to the communicator the EP path was given
++                    (channel count, NVLS resources), not to the buffer.
++
++    MEASURED at 8192 tokens: tiny/pcp/world/real ordering separates a wait from
++    a transfer, because the first arm pays 786.5 us/layer and the later arms pay
++    333-334 us/layer on identical bytes through the identical communicator.
++
++    Symmetric across ranks, so no deadlock, and it touches only scratch, so the
++    model output cannot change. It does add traffic, so wall time rises and the
++    real collective's own number is read only relative to these controls.
++    """
++    import torch
++
++    key = (tuple(t.shape), t.dtype)
++    buf = _ctl.get(key)
++    if buf is None:
++        n = t.shape[0] // comm.world_size
++        w = comm.world_size
++        buf = (
++            torch.empty_like(t.contiguous()),
++            torch.empty((n,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device),
++            torch.empty((8 * w, 8), dtype=t.dtype, device=t.device),
++            torch.empty((8, 8), dtype=t.dtype, device=t.device),
++        )
++        _ctl[key] = buf
++    ci, co, ti, to = buf
++    pc = getattr(comm, "pynccl_comm", None)
++    if pc is not None:
++        with _Rec("rs_ctl_tiny", "moe"):
++            pc.reduce_scatter(to, ti)
++        with _Rec("rs_ctl_pcp", "moe"):
++            pc.reduce_scatter(co, ci)
++    try:
++        import torch.distributed as dist
++
++        if dist.is_initialized() and dist.get_world_size() == comm.world_size:
++            with _Rec("rs_ctl_world", "moe"):
++                dist.reduce_scatter_tensor(co, ci)
++    except Exception:
++        pass
++
++
++def _install_comm_probe():
++    """Wrap the two collectives the EP path uses, at the communicator level.
++
++    Done lazily on the first span so every module is already imported, and
++    contained here so the tree needs no further edits. Records the MEASURED
++    byte count and dtype with the time, plus whether the equal-size collapse
++    that unlocks the symmetric-memory path actually happened, so the
++    dispatch/combine cost gap is read off the wire rather than inferred.
++    """
++    global _installed
++    if _installed:
++        return
++    _installed = True
++    try:
++        from vllm.distributed.device_communicators import cuda_communicator as CC
++    except Exception:
++        return
++    cls = getattr(CC, "CudaCommunicator", None)
++    if cls is None:
++        return
++
++    def mk(fn, nm):
++        def g(self, input_, *a, **k):
++            import torch
++
++            t = input_
++            if not isinstance(t, torch.Tensor):
++                t = t[0] if isinstance(t, (list, tuple)) and t else None
++            sizes = k.get("sizes")
++            if sizes is None:
++                for x in a:
++                    if isinstance(x, list):
++                        sizes = x
++            nb = t.numel() * t.element_size() if t is not None else 0
++            dt = str(t.dtype).replace("torch.", "") if t is not None else "?"
++            eq = 1 if (sizes is None or len(set(sizes)) == 1) else 0
++            try:
++                symm = 1 if CC.should_nccl_symm_mem_ag_rs() else 0
++            except Exception:
++                symm = -1
++            cg = 1 if (t is not None and t.is_contiguous()) else 0
++            key = f"{nm}|nb={nb}|dt={dt}|eq={eq}|symmok={symm}|cg={cg}"
++            if _RSCTL and nm == "reduce_scatterv" and t is not None:
++                _rs_controls(self, t)
++            with _Rec("comm", key):
++                return fn(self, input_, *a, **k)
++
++        g._ep_wrapped = True
++        return g
++
++    for nm in ("all_gatherv", "reduce_scatterv"):
++        f = getattr(cls, nm, None)
++        if f is not None and not getattr(f, "_ep_wrapped", False):
++            setattr(cls, nm, mk(f, nm))
++
++
++def _install_deepep_probe():
++    """Time the DeepEP path at its own primitives, with no tree edits.
++
++    The AgRs arm is timed through spans in naive_dp_ep.py plus a wrapper on the
++    two communicator collectives. DeepEP uses neither: it takes
++    modular_kernel's ASYNC prepare path and moves tokens inside its own kernels,
++    so the existing spans record nothing but "route" and "layer" and the
++    comparison has no phases in it.
++
++    Both classes involved are plain Python, so wrapping their methods here keeps
++    every edit in one file and keeps the two arms on the same tag names:
++
++      layout    Buffer.get_dispatch_layout, the routing metadata DeepEP needs
++      dispatch  Buffer.dispatch
++      combine   Buffer.combine
++      prep      DeepEPHTPrepareAndFinalize.prepare_async (nests dispatch)
++      recv      the receiver returned by prepare_async, where an async dispatch
++                is actually waited on
++      fin       DeepEPHTPrepareAndFinalize.finalize_async (nests combine)
++
++    With async_finish set, dispatch returns before its transfer is done and the
++    wait lands in recv rather than in dispatch, which is the distinction the
++    AgRs arm could not make.
++    """
++    pairs = []
++    try:
++        import deep_ep
++
++        pairs += [
++            (deep_ep.Buffer, "get_dispatch_layout", "layout"),
++            (deep_ep.Buffer, "dispatch", "dispatch"),
++            (deep_ep.Buffer, "combine", "combine"),
++        ]
++    except Exception:
++        pass
++    try:
++        from vllm.model_executor.layers.fused_moe.prepare_finalize import deepep_ht
++
++        cls = getattr(deepep_ht, "DeepEPHTPrepareAndFinalize", None)
++        if cls is not None:
++            pairs += [
++                (cls, "prepare_async", "prep"),
++                (cls, "finalize_async", "fin"),
++                (cls, "_receiver", "recv"),
++            ]
++    except Exception:
++        pass
++
++    def mk(fn, tag):
++        def g(*a, **k):
++            with _Rec(tag, "moe"):
++                return fn(*a, **k)
++
++        g._ep_wrapped = True
++        return g
++
++    if _SYNCDEEP:
++        _make_deepep_sync()
++
++    if _COMBBAR:
++        pairs = [p for p in pairs if p[2] != "combine"]
++        _install_combine_barrier()
++
++    for obj, name, tag in pairs:
++        f = getattr(obj, name, None)
++        if f is None or getattr(f, "_ep_wrapped", False):
++            continue
++        # get_dispatch_layout and friends are plain methods; capture is a
++        # staticmethod and is deliberately left alone.
++        setattr(obj, name, mk(f, tag))
++
++
++def _install_combine_barrier():
++    """Split DeepEP's combine into arrival skew and real transfer cost.
++
++    MEASURED at 8192 in the synchronous arm: `Buffer.combine` costs 1132.3
++    us/layer against a bare 8 rank all-to-all combine floor of 191.0 us for the
++    same bf16 volume, which is 5.93x. Dispatch over the same fabric in the same
++    layer sits at 0.92x its own floor, so the fabric is not the explanation and
++    the excess has to be attributed rather than guessed at.
++
++    A tiny collective issued immediately before the combine IS a barrier: its
++    transfer is ~4 KB, three orders of magnitude below the combine, so whatever
++    time it reports is the spread in when the 8 ranks arrive at this point in the
++    layer, not bytes. The combine that follows then starts from a synchronized
++    state and reports its own cost with the wait removed:
++
++      comb_barrier   arrival skew, i.e. the exposed expert GEMM imbalance
++      combine        transfer plus receive side reduction, wait excluded
++
++    The same trick already worked on the AgRs reduce-scatter, where a 4 KB
++    control cost 495.0 us/layer and the real 117.44 MB collective behind it cost
++    332.3 us. Symmetric across ranks so it cannot deadlock, and it touches only
++    scratch so the model output cannot change. It adds traffic and a real
++    synchronization, so wall time rises and this arm is read only for the split.
++    """
++    try:
++        import deep_ep
++        import torch
++        import torch.distributed as dist
++    except Exception:
++        return
++    f = getattr(deep_ep.Buffer, "combine", None)
++    if f is None or getattr(f, "_ep_wrapped", False):
++        return
++    box = {}
++
++    def g(*a, **k):
++        t = box.get("t")
++        if t is None and dist.is_initialized():
++            t = box["t"] = torch.zeros(8, 8, dtype=torch.bfloat16, device="cuda")
++        if t is not None:
++            with _Rec("comb_barrier", "moe"):
++                dist.all_reduce(t)
++        with _Rec("combine", "moe"):
++            return f(*a, **k)
++
++    g._ep_wrapped = True
++    deep_ep.Buffer.combine = g
++
++
++def _make_deepep_sync():
++    """Put the DeepEP transfers back on the compute stream so they can be timed.
++
++    deepep_ht.py hardcodes self.async_prepare = True (line 62) and
++    finalize_async passes do_async=True (line 425), so both dispatch and combine
++    run with async_finish and complete on DeepEP's OWN comm stream. Events
++    recorded on the compute stream then do not bracket them: combine reads 3.1
++    us/layer and roughly 750 us reappears inside the expert span, which makes
++    the phase split incomparable to the AgRs arm.
++
++    supports_async() must stay True. Returning False routes modular_kernel to
++    the fully synchronous path, which never launches the shared expert, and the
++    run dies at shared_experts.py:175 on `assert self._output[self._output_idx]
++    is not None` during the profile pass. So the async STRUCTURE is preserved and
++    only the two async_finish flags are flipped:
++
++      async_prepare = False   dispatch issues on the compute stream
++      finalize_async          re-pointed at _finalize(..., do_async=False), which
++                              runs combine plus the output copy inline and hands
++                              modular_kernel a no op receiver so its contract
++                              still holds
++
++    This changes the schedule, so this arm is for the phase split only and its
++    wall time is never the number quoted. The async arm owns that.
++    """
++    try:
++        from vllm.model_executor.layers.fused_moe.prepare_finalize import deepep_ht
++    except Exception:
++        return
++    cls = getattr(deepep_ht, "DeepEPHTPrepareAndFinalize", None)
++    if cls is None:
++        return
++    base_init = cls.__init__
++    if not getattr(base_init, "_ep_sync", False):
++
++        def init(self, *a, **k):
++            base_init(self, *a, **k)
++            self.async_prepare = False
++
++        init._ep_sync = True
++        cls.__init__ = init
++
++    if getattr(cls.finalize_async, "_ep_sync", False):
++        return
++
++    def finalize_async(
++        self,
++        output,
++        fused_expert_output,
++        topk_weights,
++        topk_ids,
++        apply_router_weight_on_input,
++        weight_and_reduce_impl,
++    ):
++        self._finalize(
++            output,
++            fused_expert_output,
++            topk_weights,
++            topk_ids,
++            apply_router_weight_on_input,
++            weight_and_reduce_impl,
++            False,
++        )
++        return lambda: None
++
++    finalize_async._ep_sync = True
++    cls.finalize_async = finalize_async
++
++
++_hspans: list = []
++_phase2_done = False
++# Which collective launched last. Both exposed waits go through the same
++# EventOverlap method, so the tag is decided by this rather than by guessing.
++_WPH = ["d"]
++
++
++class _HRec:
++    """Host wall clock bracket, appended to a separate list.
++
++    Not interchangeable with _Rec. _Rec measures DEVICE time between two CUDA
++    events; this measures the CPU time the Python call itself occupies. The two
++    differ exactly when a call blocks the host, which DeepEP's intranode
++    dispatch does when it reads the per expert receive counts back.
++    """
++
++    __slots__ = ("tag", "t0")
++
++    def __init__(self, tag):
++        self.tag = tag
++
++    def __enter__(self):
++        import time
++
++        self.t0 = time.perf_counter()
++        return self
++
++    def __exit__(self, *exc):
++        import time
++
++        _hspans.append((self.tag, (time.perf_counter() - self.t0) * 1e3))
++        return False
++
++
++def _install_phase2_probe():
++    """Split the MoE layer so nothing is left as a derived residual.
++
++    Tags added, all keyed on layer name "moe" so the reader chunks them per pass
++    exactly like the existing tags:
++
++      dwait    EventOverlap.current_stream_wait for the DISPATCH event, i.e. the
++               exposed dispatch wait on the compute stream
++      gemm     FusedMoEModularKernel._fused_experts, the routed expert GEMMs
++      wreduce  the TopKWeightAndReduce apply that runs inside _finalize BEFORE
++               Buffer.combine, so it gates the combine launch
++      shared   _maybe_apply_shared_experts, placed by the engine between the
++               combine launch and the combine wait
++      cwait    the same current_stream_wait for the COMBINE event
++      cfin     the whole finalize receiver, so cfin minus cwait is the output copy
++      hdisp    HOST wall time of Buffer.dispatch
++      hcomb    HOST wall time of Buffer.combine
++      hlayer   HOST wall time of the whole modular apply
++
++    The fixed order inside one layer is dispatch, dwait, gemm, wreduce, combine,
++    shared, cwait, which is what makes the single wait method separable.
++    """
++    global _phase2_done
++    if _phase2_done:
++        return
++    _phase2_done = True
++
++    # _ep_wrapped must be set. span() re-runs _install_deepep_probe on every
++    # call (_installed is never assigned True), and that installer only skips a
++    # method already carrying this attribute. Without it, Buffer.dispatch gains
++    # one more nested device span per MoE layer per pass and the number grows
++    # without bound.
++    def dev(fn, tag):
++        def g(*a, **k):
++            with _Rec(tag, "moe"):
++                return fn(*a, **k)
++
++        g._ep_wrapped = True
++        return g
++
++    def host(fn, tag, phase):
++        def g(*a, **k):
++            with _HRec(tag):
++                r = fn(*a, **k)
++            _WPH[0] = phase
++            return r
++
++        g._ep_wrapped = True
++        return g
++
++    def shaped(fn, tag, phase):
++        """host() plus the payload shape, so bytes and time come from one call.
++
++        Achieved bandwidth is the only way to tell a collective that is at its
++        floor from one that is not, and a byte count taken from a route dump is a
++        different measurement than the one the timer brackets. `x` is a keyword
++        in both call sites and can be a (tokens, scales) tuple for fp8 dispatch,
++        in which case both parts are counted. Shapes are host side metadata, so
++        reading them adds no synchronization.
++        """
++
++        def g(*a, **k):
++            x = k.get("x")
++            if x is None and len(a) > 1:
++                x = a[1]
++            nb = 0
++            rows = 0
++            for t in x if isinstance(x, tuple) else (x,):
++                try:
++                    nb += t.numel() * t.element_size()
++                    rows = max(rows, t.shape[0])
++                except Exception:
++                    pass
++            with _HRec(tag):
++                r = fn(*a, **k)
++            _WPH[0] = phase
++            # Not "_rows": the reader's last_pass() already stores a
++            # "<tag>_rows" key for its own per layer block list, and a trace tag
++            # of that name would overwrite it.
++            _hspans.append((tag + "_nrow", float(rows)))
++            _hspans.append((tag + "_nkb", nb / 1024.0))
++            return r
++
++        g._ep_wrapped = True
++        return g
++
++    try:
++        import deep_ep
++
++        # Wrapped OUTSIDE the existing device span, so the host number includes
++        # the same region the device number covers.
++        deep_ep.Buffer.dispatch = shaped(deep_ep.Buffer.dispatch, "hdisp", "d")
++        deep_ep.Buffer.combine = shaped(deep_ep.Buffer.combine, "hcomb", "c")
++
++        csw = deep_ep.EventOverlap.current_stream_wait
++
++        def wait(self, *a, **k):
++            with _Rec("dwait" if _WPH[0] == "d" else "cwait", "moe"):
++                return csw(self, *a, **k)
++
++        deep_ep.EventOverlap.current_stream_wait = wait
++    except Exception as e:  # pragma: no cover
++        print(f"[ep_timer] phase2 deep_ep hook failed: {e!r}")
++
++    try:
++        from vllm.model_executor.layers.fused_moe import modular_kernel as _mk
++
++        # NOT FusedMoEModularKernel. In this tree the class that owns
++        # _prepare / _fused_experts / _finalize is FusedMoEKernelModularImpl;
++        # FusedMoEKernel is the thin dispatcher above it.
++        k = _mk.FusedMoEKernelModularImpl
++        k._fused_experts = dev(k._fused_experts, "gemm")
++        k._maybe_apply_shared_experts = dev(k._maybe_apply_shared_experts, "shared")
++
++        # Host time of the whole call, for comparison against the device layer.
++        _apply = k.apply
++
++        def apply(*a, **kw):
++            with _HRec("hlayer"):
++                return _apply(*a, **kw)
++
++        k.apply = apply
++    except Exception as e:  # pragma: no cover
++        print(f"[ep_timer] phase2 modular hook failed: {e!r}")
++
++    try:
++        from vllm.model_executor.layers.fused_moe import (
++            topk_weight_and_reduce as twr,
++        )
++
++        # All four, because which one _finalize ends up calling depends on the
++        # expert backend: the first run wrapped only two and recorded nothing,
++        # which reads identically to "the reduce is free" and is not.
++        for nm in (
++            "TopKWeightAndReduceContiguous",
++            "TopKWeightAndReduceNaiveBatched",
++            "TopKWeightAndReduceNoOP",
++            "TopKWeightAndReduceDelegate",
++        ):
++            c = getattr(twr, nm, None)
++            if c is not None:
++                c.apply = dev(c.apply, "wreduce")
++    except Exception as e:  # pragma: no cover
++        print(f"[ep_timer] phase2 reduce hook failed: {e!r}")
++
++    try:
++        from vllm.model_executor.layers.fused_moe.prepare_finalize import deepep_ht
++
++        cls = deepep_ht.DeepEPHTPrepareAndFinalize
++        fa = cls.finalize_async
++
++        def finalize_async(*a, **k):
++            r = fa(*a, **k)
++            # HT returns a bare receiver, but tolerate the (hook, receiver) shape
++            # so this does not silently stop recording if the interface changes.
++            if isinstance(r, tuple):
++                hk, rc = r
++                return hk, dev(rc, "cfin")
++            return dev(r, "cfin")
++
++        finalize_async._ep_wrapped = True
++        cls.finalize_async = finalize_async
++    except Exception as e:  # pragma: no cover
++        print(f"[ep_timer] phase2 finalize hook failed: {e!r}")
++
++
++def span(tag, layer=""):
++    """Bracket a region. Returns a no op unless timing is enabled."""
++    if not _ON:
++        return _NULL
++    if not _installed:
++        _install_comm_probe()
++        _install_deepep_probe()
++        if _PHASE2:
++            _install_phase2_probe()
++    return _Rec(tag, layer)
++
++
++def _flush():
++    if not _ON or not _spans:
++        return
++    import json
++
++    import torch
++
++    torch.cuda.synchronize()
++    # ordered per call trace: {tag: [[layer, ms], ...]} in record order
++    trace: dict = {}
++    for sp in _spans:
++        trace.setdefault(sp.tag, []).append(
++            [str(sp.layer), round(sp.s.elapsed_time(sp.e), 4)]
++        )
++    # host timings carry no layer name, so they get the same "moe" key the
++    # collective spans use and chunk per pass the same way
++    for tag, ms in _hspans:
++        trace.setdefault(tag, []).append(["moe", round(ms, 4)])
++    # the process group is already torn down at atexit, so asking
++    # get_ep_group() for the rank returns nothing and every worker then writes
++    # the SAME filename and overwrites its peers. The device index is stable.
++    try:
++        rank = torch.cuda.current_device()
++    except Exception:
++        rank = -1
++    with open(f"{_ON}.rank{rank}.json", "w") as f:
++        json.dump({"trace": trace}, f)
++
++
++if _ON:
++    import atexit
++
++    atexit.register(_flush)
++
++
++# ---- matched whole-layer span ----
++# begin()/end() exist so a region spanning many statements can be bracketed
++# without being re-indented into a `with` block. Same _spans list and same
++# _flush(), so the dump format and every existing reader are unchanged.
++_open: list = []
++
++
++def begin(tag, layer=""):
++    """Open a span. Safe to call when timing is off (does nothing)."""
++    if not _ON:
++        return
++    if not _installed:
++        _install_comm_probe()
++        _install_deepep_probe()
++        if _PHASE2:
++            _install_phase2_probe()
++    import torch
++
++    s = torch.cuda.Event(enable_timing=True)
++    s.record()
++    _open.append(_Span(tag, layer, s, None))
++
++
++def end():
++    """Close the most recently opened span.
++
++    Unbalanced calls are ignored rather than raised, so a probe bug can never
++    take the engine down mid-campaign.
++    """
++    if not _ON or not _open:
++        return
++    import torch
++
++    sp = _open.pop()
++    e = torch.cuda.Event(enable_timing=True)
++    e.record()
++    sp.e = e
++    _spans.append(sp)
+diff --git a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+index 7d600de..9074718 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+@@ -2,10 +2,13 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Triton-based MoE expert implementations."""
+ 
++import os
++
+ import torch
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm import _custom_ops as ops
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe.activation import (
+     MoEActivation,
+     apply_moe_activation_supported,
+@@ -58,6 +61,56 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl
+ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+ 
++logger = init_logger(__name__)
++
++_EP_RAGGED_LOGGED = False
++
++
++def _ep_ragged_enabled(expert_map) -> bool:
++    """Both halves of the ragged grid, or neither.
++
++    Returns False whenever there is no expert_map, because without one every slot is
++    owned, ignore_invalid_experts has nothing to drop and the pad aware reducer has
++    nothing to skip, so the flag would only add two pointer arguments to moe_sum.
++    """
++    on = expert_map is not None and os.environ.get("VLLM_EP_MASKED_SUM", "") == "1"
++    # Logged once per process. A config nothing reads back is not evidence that the
++    # arm ran, and this one is invisible in the output by construction: when it works
++    # the result is bitwise identical and only the row count changes.
++    global _EP_RAGGED_LOGGED
++    if on and not _EP_RAGGED_LOGGED:
++        _EP_RAGGED_LOGGED = True
++        logger.info(
++            "EP ragged expert GEMM grid ON: ignore_invalid_experts=True "
++            "with pad aware moe_sum"
++        )
++    return on
++
++
++_EP_FAST_SILU_MODE = None
++_EP_FAST_SILU_SEEN = False
++
++
++def _ep_fast_silu_mode() -> int:
++    """0 = C kernel, 1 = Triton kernel over every row, 2 = also skip unowned rows."""
++    global _EP_FAST_SILU_MODE
++    if _EP_FAST_SILU_MODE is None:
++        import os as _os
++
++        try:
++            _EP_FAST_SILU_MODE = int(_os.environ.get("VLLM_EP_FAST_SILU", "0"))
++        except ValueError:
++            _EP_FAST_SILU_MODE = 0
++    return _EP_FAST_SILU_MODE
++
++
++def _ep_fast_silu_readback(mode: int, rows: int) -> None:
++    global _EP_FAST_SILU_SEEN
++    if _EP_FAST_SILU_SEEN:
++        return
++    _EP_FAST_SILU_SEEN = True
++    logger.info("EP fast silu ACTIVE mode=%d rows=%d", mode, rows)
++
+ 
+ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+     """Triton-based fused MoE expert implementation."""
+@@ -313,6 +366,12 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+         )
+         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+ 
++        # Ragged expert GEMM grid. ignore_invalid_experts=True makes
++        # moe_align_block_size drop this rank's not owned slots from the sorted list
++        # entirely, so num_tokens_post_padded falls from the padded RECTANGLE row
++        # count to the padded OWNED row count. It is only correct because the moe_sum
++        # below is the pad aware overload and skips the rows the GEMM never writes.
++        _ep_ragged = _ep_ragged_enabled(expert_map)
+         sorted_token_ids, expert_ids, num_tokens_post_padded = (
+             _prepare_expert_assignment(
+                 topk_ids,
+@@ -324,6 +383,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+                 use_int8_w8a16=self.quant_config.use_int8_w8a16,
+                 use_int4_w4a16=self.quant_config.use_int4_w4a16,
+                 block_shape=self.block_shape,
++                ignore_invalid_experts=_ep_ragged,
+             )
+         )
+ 
+@@ -460,11 +520,28 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+             and lora_context is None
+             and not is_deep_gemm_e8m0_used()
+         ):
+-            qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_block_quant(
+-                intermediate_cache1.view(-1, N),
+-                group_size=128,
+-                quant_dtype=current_platform.fp8_dtype(),
+-            )
++            _fs = _ep_fast_silu_mode()
++            if _fs:
++                from vllm.model_executor.layers.fused_moe.fast_silu_quant import (
++                    silu_and_mul_per_block_quant_pad_aware,
++                )
++
++                qintermediate_cache2, a2q_scale = (
++                    silu_and_mul_per_block_quant_pad_aware(
++                        intermediate_cache1.view(-1, N),
++                        group_size=128,
++                        quant_dtype=current_platform.fp8_dtype(),
++                        topk_ids=topk_ids if _fs >= 2 else None,
++                        expert_map=expert_map if _fs >= 2 else None,
++                    )
++                )
++                _ep_fast_silu_readback(_fs, intermediate_cache1.view(-1, N).shape[0])
++            else:
++                qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_block_quant(
++                    intermediate_cache1.view(-1, N),
++                    group_size=128,
++                    quant_dtype=current_platform.fp8_dtype(),
++                )
+         else:
+             self.activation(
+                 activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+@@ -556,10 +633,31 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+                 )
+ 
+         # separate function is required for MoE + LoRA
+-        self.moe_sum(intermediate_cache3, output)
++        self.moe_sum(
++            intermediate_cache3,
++            output,
++            topk_ids if _ep_ragged else None,
++            expert_map if _ep_ragged else None,
++        )
+ 
+-    def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+-        ops.moe_sum(input, output)
++    def moe_sum(
++        self,
++        input: torch.Tensor,
++        output: torch.Tensor,
++        topk_ids: torch.Tensor | None = None,
++        expert_map: torch.Tensor | None = None,
++    ) -> None:
++        """Reduce the per slot outputs into one row per token.
++
++        The pad aware overload is selected only when the caller passes both tensors,
++        which it does only when the ragged grid is on. TritonWNA16Experts inherits
++        this method and calls it with two arguments, so the extra parameters are
++        optional and that path is unchanged.
++        """
++        if topk_ids is not None and expert_map is not None:
++            ops.moe_sum(input, output, topk_ids, expert_map)
++        else:
++            ops.moe_sum(input, output)
+ 
+ 
+ class TritonWNA16Experts(TritonExperts):
+diff --git a/vllm/model_executor/layers/fused_moe/fast_silu_quant.py b/vllm/model_executor/layers/fused_moe/fast_silu_quant.py
+new file mode 100644
+index 0000000..53a5ab9
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/fast_silu_quant.py
+@@ -0,0 +1,195 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Pad-aware fused SiLU-and-mul + FP8 per-block quantize for the MoE intermediate.
++
++Replaces ``ops.silu_and_mul_per_block_quant`` on the expert-parallel Triton path. It
++does the same arithmetic, bitwise, but fixes two measured defects in the C kernel on
++DeepSeek-V3-shaped MoE layers (H200, hidden 7168, moe_intermediate 2048, E_local 32):
++
++  bandwidth  The C kernel launches one 128-thread block per ``(row, 128-element
++             group)``. Each thread loads exactly one bf16 gate element and one bf16 up
++             element, so every global access is 2 bytes wide, and the group max goes
++             through a 7-step ``__shared__`` tree with a ``__syncthreads`` per step.
++             Measured, it reaches 807-824 GB/s where a device-to-device copy of the same
++             byte volume reaches 3755-4033 GB/s: 20-22% of achievable. This kernel gives
++             each program one whole row, so the gate and up loads are contiguous and
++             full-width and the group max is a register reduction with no barrier.
++
++  padding    The C kernel has no pad awareness, so it processes every slot row of
++             ``intermediate_cache1``. Under DeepSeek-V3 routing (n_group 8, topk_group
++             4, group == EP rank) a token that reaches a rank contributes 8/4 = 2 local
++             experts on average, so roughly 75% of the rows are not owned by this rank.
++             Passing ``topk_ids`` and ``expert_map`` skips those rows, using the same
++             ownership test as ``_swiglu_limit_pad_aware_kernel`` in
++             ``fused_moe/utils.py``, which is the tree's existing precedent for this on
++             the clamped SwiGLU path.
++
++Measured on one idle H200 against the C kernel, median of 15, bitwise identical output:
++
++    recv tokens  width   rows    C kernel    this kernel
++           4019      8   32152    409.9 us        65.8 us   -84.0%
++           4019      4   16076    217.6 us        55.7 us   -74.4%
++           8127      8   65016    813.1 us       109.1 us   -86.6%
++           8127      4   32508    414.6 us        91.3 us   -78.0%
++
++The unwritten rows are safe, but only because nothing reads them, and that holds for a
++specific reason on each grid rather than in general. On the ragged grid
++(``ignore_invalid_experts=True``) ``sorted_token_ids`` contains owned slots only, so the
++second GEMM never indexes a skipped row. On the full-rectangle grid the skipped rows do
++appear in ``sorted_token_ids``, but their ``expert_ids`` entry is -1 and
++``fused_moe_kernel`` takes the ``off_experts == -1`` branch (``fused_moe.py:167`` and
++``:424``), which calls ``write_zeros_to_output`` and returns without loading A or the A
++scales. Rows are independent in this kernel, so a skipped row cannot perturb an owned
++one either. Any future caller that reads the full rectangle must pass ``topk_ids=None``.
++
++Bitwise identity required three specific lowerings and was established by measurement
++across 18 variants, not by inspection. Triton's ``/`` does not lower to ``div.rn.f32``:
++with the default divide, 73562 of 131072 group scales land one ULP away from the C
++kernel. Using ``div_rn`` for the scale and the quantize but not for the sigmoid's own
++reciprocal still leaves 4506, and ``div_rn`` everywhere with ``tl.exp`` instead of
++``libdevice.exp`` still leaves 2288. All three divides as ``div_rn`` plus
++``libdevice.exp`` gives 0 of 16777216 elements and 0 of 131072 scales. Changing any of
++them back reintroduces a deviation that no cosine check would catch, so they are not
++stylistic choices.
++"""
++
++import torch
++import triton
++import triton.language as tl
++from triton.language.extra.cuda import libdevice
++
++
++@triton.jit
++def _silu_mul_block_quant_kernel(
++    input_ptr,  # [num_rows, 2 * H], gate || up
++    out_ptr,  # [num_rows, H], fp8
++    scale_ptr,  # [num_rows, H // G], fp32
++    topk_ids_ptr,  # [num_rows] flattened, global expert ids, or None
++    expert_map_ptr,  # global -> local expert id, -1 if not local, or None
++    num_rows,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    NG: tl.constexpr,
++    QMAX: tl.constexpr,
++    MIN_SCALE: tl.constexpr,
++    MASKED: tl.constexpr,
++):
++    row = tl.program_id(0)
++    if MASKED:
++        # Same ownership test as _swiglu_limit_pad_aware_kernel: the slot's global
++        # expert id must be non-negative and must map to a local expert.
++        eid = tl.load(topk_ids_ptr + row)
++        if eid < 0:
++            return
++        lid = tl.load(expert_map_ptr + eid)
++        if lid < 0:
++            return
++
++    h = tl.arange(0, H)
++    base = row.to(tl.int64) * (2 * H)
++    gate = tl.load(input_ptr + base + h).to(tl.float32)
++    up = tl.load(input_ptr + base + H + h).to(tl.float32)
++
++    # The C kernel's exact expression: the sigmoid is its own division, then two
++    # multiplies. div_rn and libdevice.exp are required for bitwise identity.
++    sigmoid_gate = tl.math.div_rn(1.0, 1.0 + libdevice.exp(-gate))
++    result = gate * sigmoid_gate * up
++
++    result = tl.reshape(result, (NG, G))
++    group_max = tl.max(tl.abs(result), axis=1)
++    group_scale = tl.maximum(tl.math.div_rn(group_max, QMAX), MIN_SCALE)
++    q = tl.math.div_rn(result, group_scale[:, None])
++    q = tl.minimum(tl.maximum(q, -QMAX), QMAX)
++
++    tl.store(
++        out_ptr + row.to(tl.int64) * H + h,
++        tl.reshape(q, (H,)).to(out_ptr.dtype.element_ty),
++    )
++    tl.store(scale_ptr + row.to(tl.int64) * NG + tl.arange(0, NG), group_scale)
++
++
++def _supported(x: torch.Tensor, group_size: int, quant_dtype: torch.dtype) -> bool:
++    """Whether this kernel can serve the call; the caller falls back to the C op.
++
++    The row must fit in registers as fp32, and H must be a power of two so
++    ``tl.reshape`` into (groups, group_size) is exact. Both hold for every MoE shape
++    this path currently sees; the guard exists so an unusual shape degrades to the C
++    kernel instead of failing to compile.
++    """
++    if x.dim() != 2 or not x.is_contiguous():
++        return False
++    if quant_dtype != torch.float8_e4m3fn:
++        return False
++    if x.dtype not in (torch.bfloat16, torch.float16):
++        return False
++    if x.shape[1] % 2 != 0:
++        return False
++    h = x.shape[1] // 2
++    # A power-of-two H no wider than the compiled bound, holding a whole number
++    # of quantization groups: the kernel indexes the group dimension by shift.
++    return 0 < h <= 8192 and h % group_size == 0 and (h & (h - 1)) == 0
++
++
++def silu_and_mul_per_block_quant_pad_aware(
++    x: torch.Tensor,
++    group_size: int,
++    quant_dtype: torch.dtype,
++    topk_ids: torch.Tensor | None = None,
++    expert_map: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Fused SiLU-and-mul and FP8 per-block quantize, skipping unowned rows.
++
++    ``x`` is ``[num_rows, 2 * H]`` with gate in the first half. Returns
++    ``(quantized [num_rows, H], scales [num_rows, H // group_size])`` in the
++    same layout as ``ops.silu_and_mul_per_block_quant`` with
++    ``is_scale_transposed=False``.
++
++    When ``topk_ids`` is given (and ``expert_map`` with it) the rows whose expert is not
++    local are left UNWRITTEN rather than zeroed, which is what makes the saving real.
++    See the module docstring for why the callers in this tree never read them.
++    """
++    from vllm import _custom_ops as ops
++
++    if not _supported(x, group_size, quant_dtype):
++        return ops.silu_and_mul_per_block_quant(
++            x, group_size=group_size, quant_dtype=quant_dtype
++        )
++
++    num_rows, gate_up = x.shape
++    h = gate_up // 2
++    ngroup = h // group_size
++    out = torch.empty(num_rows, h, device=x.device, dtype=quant_dtype)
++    scales = torch.empty(num_rows, ngroup, device=x.device, dtype=torch.float32)
++    if num_rows == 0:
++        return out, scales
++
++    masked = topk_ids is not None and expert_map is not None
++    if masked:
++        # A mismatch here would silently mask the wrong rows, so it is checked rather
++        # than assumed: topk_ids is [num_tokens, top_k] and x is one row per slot.
++        assert topk_ids.numel() == num_rows, (
++            f"topk_ids has {topk_ids.numel()} slots but the intermediate has "
++            f"{num_rows} rows"
++        )
++        tids = topk_ids.reshape(-1)
++    else:
++        tids = None
++
++    qmax = torch.finfo(quant_dtype).max
++    _silu_mul_block_quant_kernel[(num_rows,)](
++        x,
++        out,
++        scales,
++        tids,
++        expert_map if masked else None,
++        num_rows,
++        H=h,
++        G=group_size,
++        NG=ngroup,
++        QMAX=qmax,
++        # matches min_scaling_factor<T>::val() at csrc/quantization/utils.cuh:50-53
++        MIN_SCALE=1.0 / (qmax * 512.0),
++        MASKED=masked,
++        num_warps=4,
++    )
++    return out, scales
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index 04734f7..d57ea47 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -11,6 +11,7 @@ import torch
+ 
+ import vllm.envs as envs
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe._ep_timer import span as _ep_span
+ from vllm.model_executor.layers.fused_moe.activation import (
+     ApplyMoEActivationConfig,
+     MoEActivation,
+@@ -81,6 +82,26 @@ logger = init_logger(__name__)
+ #
+ 
+ 
++def _ep_prep(pf):
++    """Time prepare_finalize.prepare in full without reindenting its caller."""
++
++    def g(*a, **k):
++        with _ep_span("prep", "moe"):
++            return pf.prepare(*a, **k)
++
++    return g
++
++
++def _ep_fin(pf):
++    """Time prepare_finalize.finalize in full."""
++
++    def g(*a, **k):
++        with _ep_span("fin", "moe"):
++            return pf.finalize(*a, **k)
++
++    return g
++
++
+ class FusedMoEActivationFormat(Enum):
+     """
+     The standard activation format (num_tokens, hidden dim).
+@@ -1218,7 +1239,7 @@ class FusedMoEKernelModularImpl:
+                 expert_tokens_meta,
+                 _expert_topk_ids,
+                 _expert_topk_weights,
+-            ) = self.prepare_finalize.prepare(
++            ) = _ep_prep(self.prepare_finalize)(
+                 hidden_states,
+                 topk_weights,
+                 topk_ids,
+@@ -1385,7 +1406,7 @@ class FusedMoEKernelModularImpl:
+         if not self.prepare_finalize.supports_async():
+             assert not dbo_enabled()
+ 
+-            self.prepare_finalize.finalize(
++            _ep_fin(self.prepare_finalize)(
+                 output,
+                 fused_out,
+                 topk_weights,
+diff --git a/vllm/model_executor/layers/fused_moe/monokernel_tp.py b/vllm/model_executor/layers/fused_moe/monokernel_tp.py
+new file mode 100644
+index 0000000..bcbda81
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/monokernel_tp.py
+@@ -0,0 +1,514 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Rank-uniform entry into the fused tensor-parallel MoE prefill path.
++
++WHY THIS FILE EXISTS AT ALL. The fused path is not an optimization a rank can
++opt into on its own. Its epilogue is a collective: communication blocks spin on
++a barrier pad waiting for peers, and a rank that does not launch the fused
++kernel never arrives. The peers then spin inside a kernel with no interrupt and
++no timeout, which is a wedged GPU rather than an error. So the decision cannot
++be per-rank, cannot be discovered lazily, and cannot be retried.
++
++The existing entry point had exactly the shape that goes wrong:
++
++    try:
++        return torch.ops.vllm.moe_monokernel_prefill(...)
++    except RuntimeError:
++        logger.warning_once(...)
++        return None
++
++That is safe for the ordinary monokernel, whose only effect is local: a rank
++that falls back to the modular path computes the same math and still joins the
++same external all-reduce, so nothing hangs. It is unsafe the moment the kernel
++itself communicates, because "this rank gave up" is invisible to the peers it
++left waiting.
++
++THE DECISION, AND WHY EACH INPUT IS RANK-UNIFORM.
++
++  configuration          Identical by construction. VllmConfig is built once and
++                         handed to every worker, so max_num_batched_tokens,
++                         num_ubatches and hidden size agree. Read at quant
++                         method construction and passed in, not re-read here.
++  token count            TP replicates the batch, so every rank in the group
++                         sees the same M for the same forward.
++  the enable flag        An environment variable, so NOT uniform by
++                         construction. It is therefore folded into the vote
++                         below rather than checked before it.
++  capability of the .so  Also not uniform by construction: each rank loads its
++                         own file from its own environment, so one rank can hold
++                         a binary without the fused entry point.
++  pool availability      A collective itself (rendezvous), so it either succeeds
++                         on every rank or fails on every rank, and it is folded
++                         into the same vote.
++
++Only tp_size is allowed to short-circuit ahead of the vote, because it comes
++from the config and cannot disagree. Everything else reaches the MIN all-reduce,
++which is what keeps a rank from returning early while its peers wait in a
++collective. After the vote the per-call decision reads only the agreed flag and
++M, and nothing left in it can differ between ranks.
++
++AFTER ENTRY THERE IS NO FALLBACK, AND THAT IS THE SAFE CHOICE. Once the gate
++says fused, every rank launches fused. A non-zero return code from the launch is
++not converted into a local fallback: doing so would drop this rank out of a
++collective its peers have already entered. It propagates, which fails the
++engine. Failing loudly is strictly better than the alternative, because the
++alternative is a hang with no diagnostic. Everything that CAN be checked is
++checked before entry, at init, collectively.
++
++SIZE POLICY IS AN EXACT-MATCH TABLE, DELIBERATELY. Only 8192 and 16384 were
++measured as wins on DS3. 2048 was measured and is not a win. Nothing in between
++was measured at all, and a range gate would quietly claim those sizes, so the
++gate is a dict lookup: an unlisted token count takes the ordinary path. ncomm is
++a plateau rather than a tuned optimum, so it is one fixed value inside the
++validated band instead of a per-size fit to boot noise.
++"""
++
++import os
++
++import torch
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++
++logger = init_logger(__name__)
++
++# MEASURED on 8 x H200, DS3 TP=8: the fused epilogue wins at 8192 and 16384 and
++# does not win at 512 or 2048. Keys are exact token counts; anything absent
++# takes the ordinary path. Values are the chunk count C the collective is
++# released in.
++_FUSED_CHUNKS_BY_TOKENS: dict[int, int] = {
++    8192: 4,
++    16384: 8,
++}
++
++# Communication blocks carved out of the persistent grid. The 12..16 band was
++# measured as a plateau, so this is a fixed value inside it rather than a
++# per-size choice fitted to run-to-run variation.
++_FUSED_NCOMM = 14
++
++
++def _env_chunk_table(default: dict[int, int]) -> dict[int, int]:
++    """Optional override of the chunk table, for tuning a new model geometry.
++
++    Unset returns the MEASURED DS3 table unchanged. A bare integer applies to
++    every token count already in the table; a "T:C,T:C" list replaces it. A
++    malformed value raises, because a tuning knob that silently does nothing
++    would make a null result look like a property of the geometry.
++    """
++    raw = os.environ.get("VLLM_PREFILL_MONOKERNEL_TP_CHUNKS", "").strip()
++    if not raw:
++        return dict(default)
++    if ":" not in raw:
++        c = int(raw)
++        if c < 1:
++            raise ValueError("VLLM_PREFILL_MONOKERNEL_TP_CHUNKS must be >= 1")
++        return {t: c for t in default}
++    out: dict[int, int] = {}
++    for item in raw.split(","):
++        t, c = item.split(":")
++        out[int(t)] = int(c)
++    if not out or any(c < 1 for c in out.values()):
++        raise ValueError(
++            f"VLLM_PREFILL_MONOKERNEL_TP_CHUNKS {raw!r} is not a usable T:C list"
++        )
++    return out
++
++
++def _env_ncomm(default: int) -> int:
++    """Optional override of the communication-block count. Unset keeps 14."""
++    raw = os.environ.get("VLLM_PREFILL_MONOKERNEL_TP_NCOMM", "").strip()
++    if not raw:
++        return default
++    n = int(raw)
++    if n < 1:
++        raise ValueError("VLLM_PREFILL_MONOKERNEL_TP_NCOMM must be >= 1")
++    return n
++
++
++# Folding the shared expert output into the same collective. On by default when
++# the loaded binary can do it, because a fused epilogue that reduces only the
++# routed half does not remove a collective from this model, it ADDS one: the
++# runner then reduces the shared half on its own, at identical bytes. MEASURED,
++# that cost 5.53% at 8192 and 3.54% at 16384 on DS3 TP=8. Set to 0 for the
++# same-binary control that separates the residual read from the fold.
++_FOLD_SHARED = os.environ.get("VLLM_PREFILL_MONOKERNEL_TP_FOLD_SHARED", "1") not in (
++    "",
++    "0",
++)
++
++
++class _FusedTPPlan:
++    """The agreed fused-path decision for this process, plus the buffers it needs.
++
++    Constructed once, on the first query, at which point the TP process group is
++    live and the vote can be taken. Everything the hot path reads is a plain
++    attribute set here.
++    """
++
++    def __init__(
++        self, hidden: int, max_tokens: int, nslots: int, enabled: bool
++    ) -> None:
++        from vllm.distributed.parallel_state import get_tp_group
++
++        self.usable = False
++        # Whether the epilogue carries the shared expert output too. Decided by
++        # the SAME vote as usable: a rank that folded while a peer did not would
++        # produce a silently different answer on that rank, which is worse than
++        # a refusal, so it is never a local decision.
++        self.fold_shared = False
++        self._local_fold = False
++        self.reason = ""
++        self.pool = None
++        self.chunks_by_tokens: dict[int, int] = {}
++        self.ncomm = _env_ncomm(_FUSED_NCOMM)
++        self.rank = 0
++        self.world = 1
++        self.nslots = max(1, int(nslots))
++        self.max_tokens = int(max_tokens)
++        self.hidden = int(hidden)
++        self._caps: dict = {}
++
++        # tp_size comes from the config, so it is the one input that may decide
++        # this ahead of the vote: it cannot disagree between ranks.
++        if (
++            not torch.distributed.is_available()
++            or not torch.distributed.is_initialized()
++        ):
++            self.reason = "torch.distributed not initialized"
++            return
++        tp = get_tp_group()
++        self.rank = tp.rank_in_group
++        self.world = tp.world_size
++        if self.world < 2:
++            self.reason = f"tp_size={self.world}"
++            return
++
++        self.chunks_by_tokens = {
++            t: c
++            for t, c in _env_chunk_table(_FUSED_CHUNKS_BY_TOKENS).items()
++            if t <= self.max_tokens
++        }
++
++        local_ok, local_reason = self._local_capability(enabled)
++        # Every rank reaches this. A rank that returned here instead would leave
++        # its peers inside the all-reduce.
++        if not self._vote(local_ok, tp):
++            self.reason = (
++                local_reason if not local_ok else "a peer rank could not run fused"
++            )
++            logger.info(
++                "fused TP MoE prefill disabled: %s (local_capable=%s)",
++                self.reason,
++                local_ok,
++            )
++            return
++
++        self.usable = True
++        logger.info(
++            "fused TP MoE prefill enabled: rank=%d world=%d slots=%d "
++            "max_tokens=%d hidden=%d ncomm=%d sizes=%s chunks=%s "
++            "fold_shared=%s",
++            self.rank,
++            self.world,
++            self.nslots,
++            self.max_tokens,
++            self.hidden,
++            self.ncomm,
++            sorted(self.chunks_by_tokens),
++            dict(sorted(self.chunks_by_tokens.items())),
++            self.fold_shared,
++        )
++
++    def _local_capability(self, enabled: bool) -> tuple[bool, str]:
++        import vllm._custom_ops as ops
++
++        if not enabled:
++            return False, "VLLM_PREFILL_MONOKERNEL_TP_FUSE is not set"
++        if not current_platform.is_cuda():
++            return False, "not CUDA"
++        if not self.chunks_by_tokens:
++            return False, (
++                f"no measured fused size fits max_num_batched_tokens={self.max_tokens}"
++            )
++        try:
++            caps = ops.prefill_monokernel_tp_caps()
++        except Exception as e:  # noqa: BLE001 - a load failure is a capability answer
++            return False, f"monokernel .so did not load: {e}"
++        if not caps.get("usable"):
++            return False, f"monokernel .so is not fused-TP capable: {caps}"
++        # The device sequence counter is what lets a replayed graph advance the
++        # barrier sequence. Without it the launch takes a host value, which a
++        # graph bakes and replays unchanged, so a second replay would wait on a
++        # sequence that has already passed. Refuse rather than ship that.
++        if not caps.get("tp_has_devseq"):
++            return False, "monokernel .so has no device sequence counter"
++        want = max(self.chunks_by_tokens.values())
++        if int(caps["tp_max_c"]) < want:
++            return False, (
++                f"binary tp_max_c={caps['tp_max_c']} below required chunks={want}"
++            )
++        if self.ncomm >= int(caps["grid_size"]):
++            return False, f"ncomm={self.ncomm} not below grid_size={caps['grid_size']}"
++        self._caps = caps
++        # Not a requirement for the fused path, so it does not refuse here: a
++        # binary without the residual entry point still runs the routed-only
++        # epilogue. It is voted on separately so that the fold itself is
++        # rank-uniform.
++        self._local_fold = bool(_FOLD_SHARED and caps.get("has_tp_residual"))
++        return True, ""
++
++    def _vote(self, local_ok: bool, tp) -> bool:
++        """MIN all-reduce over the TP group: fused runs only if every rank can.
++
++        This is the only collective the decision performs, it happens once, and
++        it happens here rather than on the per-call path precisely so that no
++        later call has to ask a peer anything.
++        """
++        # Two questions, one collective: may the fused path run at all, and
++        # does every rank's binary also fold the shared half. MIN on both, so
++        # either is refused by a single dissenting rank.
++        v = torch.tensor(
++            [1 if local_ok else 0, 1 if self._local_fold else 0],
++            dtype=torch.int32,
++            device=torch.cuda.current_device(),
++        )
++        torch.distributed.all_reduce(
++            v, op=torch.distributed.ReduceOp.MIN, group=tp.device_group
++        )
++        agreed = v.tolist()
++        if int(agreed[0]) != 1:
++            return False
++        self.fold_shared = bool(int(agreed[1]))
++        return self._build_pool(tp)
++
++    def _build_pool(self, tp) -> bool:
++        """Rendezvous the persistent pool once, here, and nowhere else.
++
++        Every rank reaches this line or none does: it is only called after the
++        vote passed on all of them, so the rendezvous inside cannot deadlock on
++        a missing peer.
++        """
++        import vllm._custom_ops as ops
++        from vllm.model_executor.layers.fused_moe.symm_output_pool import (
++            SymmOutputPool,
++        )
++
++        if torch.cuda.is_current_stream_capturing():
++            # rendezvous is a collective and cannot be captured. Capture state
++            # is itself rank-uniform, so refusing here refuses on every rank.
++            logger.warning(
++                "fused TP MoE prefill disabled: the pool cannot be created "
++                "during CUDA graph capture, and no eager call reached it first"
++            )
++            return False
++        caps = self._caps
++        pad_words = ops.prefill_monokernel_tp_pad_words(
++            int(caps["tp_max_c"]), int(caps["grid_size"]) - 1, self.world
++        )
++        try:
++            self.pool = SymmOutputPool(
++                tp.device_group.group_name,
++                self.max_tokens,
++                self.hidden,
++                pad_words,
++                nslots=self.nslots,
++                device=torch.cuda.current_device(),
++            )
++        except Exception as e:  # noqa: BLE001
++            # A rendezvous failure is symmetric: it fails on every rank in the
++            # group, so returning False here returns False everywhere.
++            logger.warning("fused TP MoE prefill disabled: pool failed: %s", e)
++            return False
++        logger.info("fused TP MoE prefill pool: %s", self.pool.describe())
++        return True
++
++    def chunks_for(self, num_tokens: int) -> int:
++        return self.chunks_by_tokens.get(int(num_tokens), 0)
++
++    def slot(self) -> int:
++        """The pool slot for the microbatch currently executing.
++
++        Rank-uniform because the ubatch index comes from the same scheduler
++        decision on every rank. Not hardcoded to 0 because DBO runs two
++        microbatches concurrently and both can hold an MoE output live.
++        """
++        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
++
++        s = int(dbo_current_ubatch_id())
++        if not 0 <= s < self.nslots:
++            raise RuntimeError(
++                f"ubatch id {s} outside pool slots [0, {self.nslots}); the pool "
++                f"was sized from ParallelConfig.num_ubatches"
++            )
++        return s
++
++
++_plan: _FusedTPPlan | None = None
++
++# Token counts already reported. The engine's prefill width is the measured
++# prompt total, not a round number, and the gate is an exact match, so which
++# widths reached this is the difference between a fused arm and a fused label.
++_seen_sizes: set[int] = set()
++
++# Diagnostic only, off unless asked for. The deduplicated log above says WHICH
++# widths reached the gate; it cannot say how many times or in what order, which
++# is what a per-iteration latency split needs. Environment rather than a config
++# field because it is a measurement aid and must not reach a serving default.
++_LOG_ALL = os.environ.get("MONO_TP_LOG_ALL", "0") not in ("", "0")
++_LOG_ALL_MIN = int(os.environ.get("MONO_TP_LOG_MIN", "512"))
++_call_seq = 0
++
++
++def fused_tp_plan(hidden: int, max_tokens: int, nslots: int) -> _FusedTPPlan:
++    global _plan
++    if _plan is None:
++        _plan = _FusedTPPlan(
++            hidden, max_tokens, nslots, envs.VLLM_PREFILL_MONOKERNEL_TP_FUSE
++        )
++    return _plan
++
++
++def reset_fused_tp_plan() -> None:
++    """Drop the cached plan, releasing the pool with it. For tests that build
++    more than one configuration in a single process."""
++    global _plan
++    _plan = None
++    _seen_sizes.clear()
++
++
++def output_is_fused(out: torch.Tensor | None) -> bool:
++    """Was this tensor produced by the fused epilogue, and therefore already
++    summed across the TP group?
++
++    Answered from the tensor's address rather than from a flag, because a flag
++    would have to be mutable process state and this is read from inside an
++    opaque op that a CUDA graph may replay. The fused output is a view of a
++    symmetric pool slot: a separate allocation that the caching allocator never
++    hands out, whose address is fixed for the life of the process and baked
++    unchanged into any captured graph. So an address match is proof, and a
++    non-fused output cannot collide with it.
++    """
++    p = _plan
++    if out is None or p is None or not p.usable or p.pool is None:
++        return False
++    return out.data_ptr() == p.pool.base_ptr(p.slot())
++
++
++def _scales_f32c(layer, attr: str) -> torch.Tensor:
++    """The scale tensor as fp32 contiguous, converted at most once per layer.
++
++    The op converts its scale arguments on every call, and the weights are
++    frozen after loading, so the conversion is a constant being recomputed. The
++    harness already removes it for the allocating op (wrapfix's S, bitwise
++    identical, 9.5 us a call where it was measured); the fused path takes the
++    mutating op, which wrapfix does not wrap. Caching here is what makes the
++    fused arm and the ordinary monokernel arm the same condition apart from the
++    epilogue.
++
++    Free when the scales are already fp32 and contiguous: .float() and
++    .contiguous() both return self, so the cache holds the original tensor and
++    costs no memory.
++    """
++    t = getattr(layer, attr)
++    key = f"_mk_f32_{attr}"
++    c = getattr(layer, key, None)
++    if c is None or c.shape != t.shape or c.device != t.device:
++        c = t.float().contiguous()
++        setattr(layer, key, c)
++    return c
++
++
++def fused_tp_launch(
++    x: torch.Tensor,
++    router_logits: torch.Tensor,
++    layer,
++    weight_scale_name: str,
++    bias: torch.Tensor | None,
++    max_tokens: int,
++    nslots: int,
++    residual: torch.Tensor | None = None,
++    out_scale: float = 1.0,
++) -> torch.Tensor | None:
++    """Run the fused TP MoE prefill, or return None to take the ordinary path.
++
++    Returning None is a rank-uniform outcome: every input to that decision is
++    either configuration, the replicated token count, or capability agreed at
++    init. Once this function launches, it does not fall back.
++    """
++    hidden = layer.w2_weight.size(1)
++    plan = fused_tp_plan(hidden, max_tokens, nslots)
++    if not plan.usable:
++        return None
++    chunks = plan.chunks_for(x.size(0))
++    n = int(x.size(0))
++    if _LOG_ALL and n >= _LOG_ALL_MIN:
++        global _call_seq
++        _call_seq += 1
++        logger.info(
++            "fused TP MoE prefill call #%d tokens=%d chunks=%d",
++            _call_seq,
++            n,
++            chunks,
++        )
++    if n not in _seen_sizes:
++        _seen_sizes.add(n)
++        logger.info(
++            "fused TP MoE prefill sees tokens=%d -> %s",
++            n,
++            f"FUSED chunks={chunks} ncomm={plan.ncomm}"
++            if chunks
++            else "ordinary path, this token count is not a measured size",
++        )
++    if chunks == 0:
++        return None
++    if plan.fold_shared and residual is None:
++        # The fold is the whole reason this epilogue removes a collective, so
++        # entering it without the shared half would reinstate the separate
++        # reduce this path exists to delete. Rank-uniform: residual availability
++        # follows the shared-experts order, which follows the token count, which
++        # TP replicates.
++        logger.warning_once(
++            "fused TP MoE prefill declined at tokens=%d: the fold is enabled "
++            "but the shared expert output was not available before the launch",
++            n,
++        )
++        return None
++    if residual is not None:
++        if residual.shape != (n, hidden) or residual.dtype != torch.bfloat16:
++            raise RuntimeError(
++                f"folded residual must be [{n}, {hidden}] bfloat16, got "
++                f"{tuple(residual.shape)} {residual.dtype}"
++            )
++        if not residual.is_contiguous():
++            raise RuntimeError("folded residual must be contiguous")
++
++    slot = plan.slot()
++    pool = plan.pool
++    out = pool.output(x.size(0), slot)
++    # Cheap and worth it: this is the check that catches a released multicast
++    # mapping that a captured graph still points at, which is otherwise a
++    # use-after-free the kernel cannot detect.
++    pool.assert_stable()
++
++    torch.ops.vllm.moe_monokernel_prefill_out(
++        x,
++        router_logits,
++        layer.w13_weight,
++        _scales_f32c(layer, f"w13_{weight_scale_name}"),
++        layer.w2_weight,
++        _scales_f32c(layer, f"w2_{weight_scale_name}"),
++        out,
++        layer.top_k,
++        getattr(layer, "renormalize", True),
++        bias,
++        pool.mc_ptr(slot),
++        pool.pads_ptr,
++        pool.seqctr_ptr,
++        plan.rank,
++        plan.world,
++        chunks,
++        plan.ncomm,
++        residual if plan.fold_shared else None,
++        float(out_scale) if plan.fold_shared else 1.0,
++    )
++    return out
+diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ht.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ht.py
+index f30e0be..e325dbe 100644
+--- a/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ht.py
++++ b/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ht.py
+@@ -1,11 +1,16 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import atexit
++import os
+ from collections.abc import Callable
+ 
+ import deep_ep
+ import torch
++import triton
++import triton.language as tl
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+     TopKWeightAndReduceContiguous,
+@@ -25,6 +30,223 @@ from vllm.v1.worker.ubatching import (
+     dbo_yield_and_switch_from_compute_to_comm,
+ )
+ 
++_EP_TOPK_COMPACT = int(os.environ.get("VLLM_EP_TOPK_COMPACT", "") or 0)
++# Ask DeepEP for a static worst-case recv width so `intranode_dispatch` skips its
++# host spin and becomes CUDA-graph capturable. 0 = in-tree dynamic width.
++_EP_CG_WORST = int(os.environ.get("VLLM_EP_CG_WORST", "") or 0)
++# Read back, not assumed: the ragged expert GEMM grid lives in triton_moe.py behind
++# its own env gate, and without it the worst-case width costs ~2x GEMM rows. Refusing
++# here is what keeps a graph baseline and a graph optimized arm on the same padding
++# cost.
++_EP_CG_RAGGED = int(os.environ.get("VLLM_EP_MASKED_SUM", "") or 0)
++if _EP_CG_WORST and not _EP_CG_RAGGED:
++    raise RuntimeError(
++        "VLLM_EP_CG_WORST=1 requires VLLM_EP_MASKED_SUM=1. num_worst_tokens pads "
++        "the recv buffer to local_tokens x num_ranks (2.04x real rows at T=8192), "
++        "and without the ragged expert GEMM grid those padded rows still occupy "
++        "grid blocks, so a graph arm without it pays ~2x expert-GEMM rows. Under "
++        "CUDA graphs the ragged grid is a requirement of the only "
++        "capture-compatible dispatch mode, and it must be set on the baseline arm "
++        "too or the comparison is not apples-to-apples."
++    )
++if _EP_CG_WORST and _EP_TOPK_COMPACT:
++    raise RuntimeError(
++        "VLLM_EP_CG_WORST=1 is incompatible with VLLM_EP_TOPK_COMPACT=1: the "
++        "compaction receiver sizes its output with a .tolist() on a device tensor, "
++        "which is a host sync and is illegal inside CUDA graph capture."
++    )
++_EP_CG_LOGGED = [False]
++_logger = init_logger(__name__)
++# Reported at process exit rather than on the first call, because the first
++# _receiver call in a profiling boot is a dummy pass whose width is not the width
++# the engine runs. The histogram is keyed by the width the DATA produced, so a model
++# whose routing does not compact shows up as width == full instead of silently
++# looking like a win.
++_EP_COMPACT_HIST: dict = {}
++# calls, owned slots, full width slots, widest row rectangle slots
++_EP_COMPACT_SUM = [0, 0, 0, 0]
++
++
++def _ep_compact_report():
++    """Three slot counts, so the rectangle's own waste is visible.
++
++    full    what the tree feeds the GEMM today, recv tokens * top_k.
++    rect    what this patch feeds it, recv tokens * the WIDEST row.
++    owned   what a ragged layout would feed it, the exact owned slot total.
++
++    rect vs owned is the headroom this patch does NOT recover, and it is only zero
++    when every row happens to own the same number of slots.
++    """
++    if not _EP_COMPACT_HIST:
++        return
++    calls, owned, full, rect = _EP_COMPACT_SUM
++    dist = " ".join(f"w{w}:{_EP_COMPACT_HIST[w]}" for w in sorted(_EP_COMPACT_HIST))
++    mean_w = sum(w * c for w, c in _EP_COMPACT_HIST.items()) / max(calls, 1)
++    _logger.info(
++        "EP topk compaction arm %d, %d calls, width histogram %s, mean width %.2f",
++        _EP_TOPK_COMPACT,
++        calls,
++        dist,
++        mean_w,
++    )
++    if owned:
++        _logger.info(
++            "EP topk compaction slot rows: full %d, widest row rectangle %d "
++            "(%.1f%% of full), exact owned %d (%.1f%% of full, %.1f%% of the "
++            "rectangle), so a ragged layout would remove a further %.2fx",
++            full,
++            rect,
++            100.0 * rect / full,
++            owned,
++            100.0 * owned / full,
++            100.0 * owned / max(rect, 1),
++            rect / max(owned, 1),
++        )
++
++
++atexit.register(_ep_compact_report)
++
++
++@triton.jit
++def _ep_amax_kernel(ids_ptr, out_ptr, n, FULL: tl.constexpr, BR: tl.constexpr):
++    """Widest row and total owned slots, in one kernel and one 8 byte buffer.
++
++    out[0] is the max over rows of the owned slot count, which is the width the
++    compacted tensor needs. out[1] is the sum, which is the number of rows a fully
++    ragged layout would need. Both come back in a single host copy, so recording the
++    ragged total costs nothing on top of the width the pack already has to know.
++
++    The caller must zero the buffer. An atomic_max against a stale value returns
++    a width that is too WIDE, which shows up as a smaller win rather than as a bug.
++    """
++    pid = tl.program_id(0)
++    rows = pid * BR + tl.arange(0, BR)
++    c = tl.arange(0, FULL)
++    m = rows[:, None] < n
++    ids = tl.load(ids_ptr + rows[:, None] * FULL + c[None, :], mask=m, other=-1)
++    cnt = tl.sum((ids != -1).to(tl.int32), axis=1)
++    tl.atomic_max(out_ptr, tl.max(cnt, axis=0))
++    tl.atomic_add(out_ptr + 1, tl.sum(cnt, axis=0))
++
++
++@triton.jit
++def _ep_pack_kernel(
++    ids_ptr,
++    wts_ptr,
++    oid_ptr,
++    owt_ptr,
++    W,
++    FULL: tl.constexpr,
++    FAKE,
++    OFFSET,
++    HAS_W: tl.constexpr,
++):
++    """Move each row's owned slots to the front, one program per row, one pass.
++
++    The output row is built in REGISTERS and stored once. Two stores from different
++    lanes to the same column would race: lane j writing the not owned filler and
++    lane i writing a real id are not ordered within a program.
++
++    The gather is a select over the FULL columns rather than a sort: output column j
++    takes the source column whose exclusive owned count equals j. FULL is 8 here, so
++    the FULL x FULL compare is 64 lanes and is cheaper than any sort. MEASURED at
++    7.9 to 10.4 us on the real shapes, which is LESS than the torch.where it
++    replaces.
++    """
++    r = tl.program_id(0)
++    c = tl.arange(0, FULL)
++    ids = tl.load(ids_ptr + r * FULL + c)
++    v = ids != -1
++    pos = tl.cumsum(v.to(tl.int32), axis=0) - 1  # rank of each owned slot
++    sel = (pos[None, :] == c[:, None]) & v[None, :]
++    hit = tl.sum(sel.to(tl.int32), axis=1) > 0
++    oid = tl.sum(tl.where(sel, (ids + OFFSET)[None, :], 0), axis=1)
++    keep = (c < W) & hit
++    tail = (c < W) & (hit == 0)
++    tl.store(oid_ptr + r * W + c, oid, mask=keep)
++    # the tail of a short row keeps the not owned id, exactly as the default path,
++    # so expert_map turns it back into -1 and the row is zeroed
++    tl.store(oid_ptr + r * W + c, FAKE, mask=tail)
++    if HAS_W:
++        wts = tl.load(wts_ptr + r * FULL + c)
++        owt = tl.sum(tl.where(sel, wts[None, :], 0.0), axis=1)
++        tl.store(owt_ptr + r * W + c, owt, mask=keep)
++        # 0.0 rather than the original weight: the tail id is not owned so the
++        # weight is never read, and a zero cannot contribute even if it were
++        tl.store(owt_ptr + r * W + c, 0.0, mask=tail)
++
++
++def _default_expert_topk(ids, num_experts, offset):
++    return torch.where(ids == -1, num_experts - 1 if offset == 0 else 0, ids + offset)
++
++
++def _compact_expert_topk_eager(ids, weights, num_experts, offset):
++    """The first version, kept selectable so its cost stays measurable.
++
++    MEASURED at +134.0 us (4019 recv tokens), +146.8 us (8127) and +131.9 us
++    (ragged, width 5) over the default torch.where, against the Triton path's
++    +36.5 us on the same three shapes.
++    """
++    valid = ids != -1
++    full = ids.size(1)
++    order = torch.argsort((~valid).to(torch.int32), dim=1, stable=True)
++    w = int(valid.sum(1).max().item())
++    if 0 < w < full:
++        ids = ids.gather(1, order)[:, :w].contiguous()
++        if weights is not None:
++            weights = weights.gather(1, order)[:, :w].contiguous()
++        valid = ids != -1
++    _EP_COMPACT_HIST[w] = _EP_COMPACT_HIST.get(w, 0) + 1
++    _EP_COMPACT_SUM[0] += 1
++    fake = num_experts - 1 if offset == 0 else 0
++    return torch.where(valid, ids + offset, fake), weights
++
++
++def _compact_expert_topk(ids, weights, num_experts, offset):
++    """Narrow the topk width to the slots this rank actually owns.
++
++    Returns (ids, weights) with the SAME global id convention the default path
++    produces: owned slots offset into the global expert space, any remaining tail
++    slot left at the not owned id that expert_map turns back into -1.
++
++    Two kernels and one 8 byte host copy. The rows are partitioned, not sorted, and
++    the relative order of the owned slots is preserved because the weight column is
++    cut with the same permutation; a reorder that did not preserve it would pair a
++    weight with the wrong expert while still producing a plausible looking tensor.
++    """
++    n, full = ids.shape
++    fake = num_experts - 1 if offset == 0 else 0
++    buf = torch.zeros(2, dtype=torch.int32, device=ids.device)
++    br = 128
++    _ep_amax_kernel[(triton.cdiv(n, br),)](ids, buf, n, FULL=full, BR=br, num_warps=4)
++    w, owned = (int(x) for x in buf.tolist())
++    _EP_COMPACT_HIST[w] = _EP_COMPACT_HIST.get(w, 0) + 1
++    _EP_COMPACT_SUM[0] += 1
++    _EP_COMPACT_SUM[1] += owned
++    _EP_COMPACT_SUM[2] += n * full
++    _EP_COMPACT_SUM[3] += n * max(w, 1)
++    w = max(w, 1)
++    if w >= full:
++        return _default_expert_topk(ids, num_experts, offset), weights
++    oid = torch.empty(n, w, dtype=ids.dtype, device=ids.device)
++    has_w = weights is not None
++    owt = (
++        torch.empty(n, w, dtype=weights.dtype, device=weights.device) if has_w else ids
++    )
++    _ep_pack_kernel[(n,)](
++        ids,
++        weights if has_w else ids,
++        oid,
++        owt,
++        w,
++        FULL=full,
++        FAKE=fake,
++        OFFSET=offset,
++        HAS_W=has_w,
++        num_warps=1,
++    )
++    return oid, (owt if has_w else None)
++
+ 
+ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
+     """
+@@ -145,6 +367,35 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
+         if has_scales:
+             token_data = (tokens, token_scales)
+ 
++        # Worst case is every local token landing on every rank. It is a bound, not
++        # a prediction: DS3 routing sends a token to exactly 4 of 8 ranks, so ~2.04x
++        # of this is real. The bound has to be static because a static shape is the
++        # whole point.
++        #
++        # Gated on actual capture, not on the env flag alone, and the reason is
++        # measured. `profile_run` calls `_dummy_run(self.max_num_tokens)` and under
++        # PCP that width is not sharded, so `tokens.size(0)` is the global 8192 there
++        # rather than the per-rank 1024 a real forward sees. The bound then becomes
++        # 8192 x 8 = 65536 and fused_experts' workspace2 becomes
++        # 65536 x 8 x 4096 x 2 = exactly 4.00 GiB, which is the allocation that OOM'd
++        # the first attempt at both GPUUTIL 0.86 and 0.80. Keying on
++        # `is_current_stream_capturing()` means the worst-case width appears only
++        # where it is actually needed, and it also keeps the memory-profiling pass
++        # byte-for-byte the same as the baseline arm, so both arms size their KV cache
++        # identically.
++        _nworst = 0
++        if _EP_CG_WORST and torch.cuda.is_current_stream_capturing():
++            _nworst = tokens.size(0) * self.num_dispatchers_
++            if not _EP_CG_LOGGED[0]:
++                _EP_CG_LOGGED[0] = True
++                _logger.info(
++                    "EP cg worst-case dispatch ACTIVE: nworst=%d local_tokens=%d "
++                    "ranks=%d ragged_grid=%d",
++                    _nworst,
++                    tokens.size(0),
++                    self.num_dispatchers_,
++                    _EP_CG_RAGGED,
++                )
+         (
+             token_data,
+             expert_topk_ids,
+@@ -164,6 +415,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
+             # expert_alignment rounds the number of tokens per expert
+             # to this value.
+             expert_alignment=1,
++            # 0 keeps the in-tree dynamic width and its host spin. > 0 takes
++            # deep_ep.cpp:441's no-sync branch.
++            num_worst_tokens=_nworst,
+             config=self._get_dispatch_config(),
+             previous_event=previous_event,
+             async_finish=self.async_prepare and not dbo_enabled(),
+@@ -224,18 +478,51 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
+         # the topk_ids to move it back to the global experts space so it aligns
+         # with existing vLLM interfaces.
+         assert expert_topk_ids is not None
+-        expert_topk_ids = torch.where(
+-            expert_topk_ids == -1,
+-            num_experts - 1 if self.rank_expert_offset == 0 else 0,
+-            expert_topk_ids + self.rank_expert_offset,
+-        )
++        if _EP_TOPK_COMPACT and expert_topk_ids.numel() > 0:
++            # Same ids the else branch produces, minus the slots that would only
++            # ever be zeroed. See _compact_expert_topk.
++            fn = (
++                _compact_expert_topk
++                if _EP_TOPK_COMPACT == 1
++                else _compact_expert_topk_eager
++            )
++            expert_topk_ids, expert_topk_weights = fn(
++                expert_topk_ids,
++                expert_topk_weights,
++                num_experts,
++                self.rank_expert_offset,
++            )
++        else:
++            expert_topk_ids = torch.where(
++                expert_topk_ids == -1,
++                num_experts - 1 if self.rank_expert_offset == 0 else 0,
++                expert_topk_ids + self.rank_expert_offset,
++            )
+ 
+-        # Makes a GPU-CPU copy.
+-        # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
+-        # on GPU.
+-        expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
+-            expert_num_tokens_per_expert_list, device=expert_x.device
+-        )
++        if _EP_CG_WORST and not expert_num_tokens_per_expert_list:
++            # The second condition is a readback, not belt and braces. The
++            # worst-case width is applied only while the stream is capturing, so on
++            # a non-captured pass this same receiver runs with a populated list and
++            # must take the in-tree branch. Keying on the list DeepEP actually
++            # returned is what makes both paths correct from one gate.
++            #
++            # With num_worst_tokens > 0 DeepEP returns an empty per-expert count
++            # list (buffer.py:350-352), because producing it is the CPU sync this
++            # arm removes. Passing None is not a shortcut: measured by grep,
++            # `expert_tokens_meta` appears in experts/triton_moe.py only at lines
++            # 263, 287 and 721, all of them parameter declarations, and is never
++            # dereferenced; modular_kernel.py only plumbs it through, and its own
++            # docstring at line 879 says the field is "for batched" experts. The
++            # contiguous HT path builds its grid from moe_align_block_size over
++            # topk_ids instead. So there is nothing to recompute on GPU here.
++            expert_tokens_meta = None
++        else:
++            # Makes a GPU-CPU copy.
++            # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
++            # on GPU.
++            expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
++                expert_num_tokens_per_expert_list, device=expert_x.device
++            )
+ 
+         # * For non-block quant, dispatch in b16 and quantize now as
+         #   DeepEP kernels only support dispatching block scales.
+diff --git a/vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py b/vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
+index 89f3843..b4cac15 100644
+--- a/vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
++++ b/vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py
+@@ -4,6 +4,7 @@ import torch
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.distributed import get_ep_group
++from vllm.model_executor.layers.fused_moe._ep_timer import span as _ep_span
+ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+     TopKWeightAndReduceContiguous,
+@@ -68,6 +69,12 @@ def _unwrap_scale_and_prepare_for_moe(
+     return a1q_scale
+ 
+ 
++def _ep_combine(out, is_sp):
++    """Timed wrapper for the combine collective."""
++    with _ep_span("combine", "moe"):
++        return get_ep_group().combine(out, is_sequence_parallel=is_sp)
++
++
+ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
+     """
+     Naive Prepare/Finalize for Dp/Ep case for Modular Kernels.
+@@ -155,13 +162,14 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
+                 extra_tensors = []
+             extra_tensors.append(local_token_lora_mapping)
+ 
+-        res = get_ep_group().dispatch(
+-            a1q,
+-            topk_weights,
+-            topk_ids,
+-            is_sequence_parallel=self.is_sequence_parallel,
+-            extra_tensors=extra_tensors,
+-        )
++        with _ep_span("dispatch", "moe"):
++            res = get_ep_group().dispatch(
++                a1q,
++                topk_weights,
++                topk_ids,
++                is_sequence_parallel=self.is_sequence_parallel,
++                extra_tensors=extra_tensors,
++            )
+ 
+         if extra_tensors is None:
+             assert len(res) == 3
+@@ -204,9 +212,7 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
+             apply_router_weight_on_input=apply_router_weight_on_input,
+         )
+ 
+-        output.copy_(
+-            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+-        )
++        output.copy_(_ep_combine(out, self.is_sequence_parallel))
+ 
+ 
+ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMonolithic):
+@@ -255,12 +261,13 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
+             a1, quant_config, defer_input_quant
+         )
+ 
+-        res = get_ep_group().dispatch_router_logits(
+-            a1q,
+-            router_logits,
+-            is_sequence_parallel=self.is_sequence_parallel,
+-            extra_tensors=scales,
+-        )
++        with _ep_span("dispatch", "moe"):
++            res = get_ep_group().dispatch_router_logits(
++                a1q,
++                router_logits,
++                is_sequence_parallel=self.is_sequence_parallel,
++                extra_tensors=scales,
++            )
+ 
+         if scales is None:
+             assert len(res) == 2
+@@ -277,9 +284,10 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
+         self,
+         fused_expert_output: torch.Tensor,
+     ) -> torch.Tensor:
+-        out = get_ep_group().combine(
+-            fused_expert_output, is_sequence_parallel=self.is_sequence_parallel
+-        )
++        with _ep_span("combine", "moe"):
++            out = get_ep_group().combine(
++                fused_expert_output, is_sequence_parallel=self.is_sequence_parallel
++            )
+         return out
+ 
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index aaf9ba6..e672840 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from collections.abc import Callable, Iterable
+ from contextlib import nullcontext
+ from typing import TYPE_CHECKING
+@@ -21,6 +22,9 @@ from vllm.forward_context import (
+     is_forward_context_available,
+ )
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe._ep_timer import begin as _ep_begin
++from vllm.model_executor.layers.fused_moe._ep_timer import end as _ep_end
++from vllm.model_executor.layers.fused_moe._ep_timer import span as _ep_span
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEConfig,
+@@ -53,6 +57,11 @@ from vllm.utils.torch_utils import (
+ 
+ logger = init_logger(__name__)
+ 
++# Diagnostic budget for the shared-expert fold probe, see _fold_debug_probe.
++# Off unless the environment variable is set, and spent on the first fused call
++# so that a debug run costs one extra kernel call and two extra collectives.
++_FOLD_DEBUG_LEFT = int(os.environ.get("VLLM_PREFILL_MONOKERNEL_TP_FOLD_DEBUG") or 0)
++
+ 
+ def register_layer_for_moe_forward_op(
+     vllm_config: VllmConfig,
+@@ -215,6 +224,127 @@ def _unpack(
+         return (None, result)
+ 
+ 
++# --- env gated routing probe (off unless VLLM_EP_ROUTE_DUMP is set) ---------
++_EP_ROUTE_DUMP = os.environ.get("VLLM_EP_ROUTE_DUMP", "")
++# Read once into a module constant, so that when timing is off Dynamo folds the
++# `if _EP_TIME_ON:` guards below to false and the probe calls leave no trace in the
++# traced graph at all.
++_EP_TIME_ON = bool(os.environ.get("VLLM_EP_TIME_DUMP", ""))
++_ep_route_state: dict = {}
++
++
++def _ep_route_record(layer_name, topk_ids):
++    """Accumulate per layer expert and destination rank statistics.
++
++    Placement agnostic: the probe runs after the EPLB remap, so `topk_ids` are
++    PHYSICAL slot ids. `VLLM_EP_ROUTE_EPHYS` gives the physical slot count and the
++    per-rank stride follows from it, which makes `rows_lin` the real per-rank rows
++    and `d_lin` the real destination rank fan-out under any placement. Nothing here
++    is a timing measurement.
++    """
++    import torch as _t
++
++    ids = topk_ids.detach().to(_t.int64)
++    if ids.dim() != 2:
++        return
++    T, K = ids.shape
++    ep = 8
++    Elog = int(_ep_route_state.get("Elog", 0)) or 256
++    _ep_route_state["Elog"] = Elog
++    Ephys = int(_ep_route_state.get("Ephys", 0))
++    if Ephys == 0:
++        Ephys = int(os.environ.get("VLLM_EP_ROUTE_EPHYS", str(Elog)))
++        _ep_route_state["Ephys"] = Ephys
++    per = Ephys // ep
++    glog = Elog // ep
++
++    hist = _t.bincount(ids.reshape(-1), minlength=Ephys)
++    # actual owner rank of each chosen physical slot
++    r_lin = ids // per
++    # the scattered reference placement, on the LOGICAL id so it stays comparable
++    r_rr = (ids % Elog) % ep
++    oh_lin = _t.zeros(T, ep, device=ids.device, dtype=_t.int64)
++    oh_lin.scatter_(1, r_lin, 1)
++    oh_rr = _t.zeros(T, ep, device=ids.device, dtype=_t.int64)
++    oh_rr.scatter_(1, r_rr, 1)
++    # exact per token LOGICAL expert-group set as an 8 bit mask, 256 bins total
++    g = (ids % Elog) // glog
++    oh_g = _t.zeros(T, ep, device=ids.device, dtype=_t.int64)
++    oh_g.scatter_(1, g, 1)
++    _w = 1 << _t.arange(ep, device=ids.device, dtype=_t.int64)
++    gmask = _t.bincount((oh_g * _w).sum(1), minlength=1 << ep)
++    d_lin = _t.bincount(oh_lin.sum(1), minlength=ep + 1)
++    d_rr = _t.bincount(oh_rr.sum(1), minlength=ep + 1)
++    rows_lin = _t.bincount(r_lin.reshape(-1), minlength=ep)
++    rows_rr = _t.bincount(r_rr.reshape(-1), minlength=ep)
++
++    # one record per call: the engine runs dummy profile passes before the
++    # real prefill and pooling them together corrupts the routing statistics
++    seen = _ep_route_state.setdefault("_n", {})
++    lname = str(layer_name)
++    seen[lname] = seen.get(lname, 0) + 1
++    key = f"{lname}|T{T}|c{seen[lname]}"
++    rec = _ep_route_state.setdefault(
++        key,
++        {
++            "calls": 0,
++            "T": T,
++            "K": K,
++            "Ephys": Ephys,
++            "idmax": 0,
++            "hist": [0] * Ephys,
++            "d_lin": [0] * (ep + 1),
++            "d_rr": [0] * (ep + 1),
++            "rows_lin": [0] * ep,
++            "rows_rr": [0] * ep,
++            "gmask": [0] * (1 << ep),
++        },
++    )
++    rec["calls"] += 1
++    rec["idmax"] = max(rec["idmax"], int(ids.reshape(-1).max().item()))
++    for name, t in (
++        ("hist", hist),
++        ("d_lin", d_lin),
++        ("d_rr", d_rr),
++        ("rows_lin", rows_lin),
++        ("rows_rr", rows_rr),
++        ("gmask", gmask),
++    ):
++        cur = rec[name]
++        vals = t.tolist()
++        for i, v in enumerate(vals):
++            cur[i] += int(v)
++
++
++def _ep_route_flush():
++    if not _EP_ROUTE_DUMP or not _ep_route_state:
++        return
++    import json as _j
++
++    # The TP rank is 0 on every worker under TP=1/PCP=8, so all eight would
++    # write one file. Use the global rank, which is distinct by construction.
++    rank = -1
++    try:
++        import torch.distributed as _dist
++
++        if _dist.is_available() and _dist.is_initialized():
++            rank = _dist.get_rank()
++    except Exception:
++        rank = -1
++    if rank < 0:
++        rank = int(os.environ.get("VLLM_DP_RANK", os.environ.get("RANK", "0")))
++    out = {k: v for k, v in _ep_route_state.items() if isinstance(v, dict) and "T" in v}
++    with open(f"{_EP_ROUTE_DUMP}.rank{rank}.json", "w") as f:
++        _j.dump({"E": _ep_route_state.get("E", 256), "layers": out}, f)
++
++
++if _EP_ROUTE_DUMP:
++    import atexit as _atexit
++
++    _atexit.register(_ep_route_flush)
++# --- end routing probe -----------------------------------------------------
++
++
+ class MoERunner(MoERunnerInterface):
+     """
+     Standard MoE runner implementation for executing Mixture of Experts layers.
+@@ -407,6 +537,137 @@ class MoERunner(MoERunnerInterface):
+             and self._quant_method.moe_kernel.output_is_reduced()
+         )
+ 
++    @property
++    def _monokernel_reduce_folded(self) -> bool:
++        """Does the monokernel path reduce its own output, at every token count?
++
++        Read from routed_experts.quant_method, the same object
++        _maybe_moe_monokernel offers the work to, and through getattr so a quant
++        method without a monokernel path is untouched.
++        """
++        probe = getattr(
++            self.routed_experts.quant_method, "monokernel_output_is_reduced", None
++        )
++        return bool(probe()) if probe is not None else False
++
++    def _fold_debug_probe(
++        self,
++        hidden_states: torch.Tensor,
++        router_logits: torch.Tensor,
++        residual: torch.Tensor,
++        fused_out: torch.Tensor,
++    ) -> None:
++        """Project the folded output onto its two halves and print the fit.
++
++        Diagnostic only, off unless VLLM_PREFILL_MONOKERNEL_TP_FOLD_DEBUG is
++        set, and budgeted to the first call per process so it cannot dominate a
++        run. See the module patch note for how a and b are read.
++        """
++        global _FOLD_DEBUG_LEFT
++        if _FOLD_DEBUG_LEFT <= 0:
++            return
++        _FOLD_DEBUG_LEFT -= 1
++
++        import torch.distributed as dist
++
++        # The unfused routed partial, from the same inputs. The fused path
++        # declines a residual-free call, so this lands on the ordinary entry.
++        routed_partial = self._maybe_moe_monokernel(hidden_states, router_logits)
++        if routed_partial is None:
++            logger.info("[folddbg] no unfused routed output, probe skipped")
++            return
++
++        scale = float(self.routed_scaling_factor)
++        r = tensor_model_parallel_all_reduce(routed_partial.float() * scale)
++        s = tensor_model_parallel_all_reduce(residual.float())
++        got = fused_out.float()
++        ref = r + s
++
++        def dot(a, b):
++            return float((a * b).sum().item())
++
++        rr, ss, rs = dot(r, r), dot(s, s), dot(r, s)
++        gr, gs = dot(got, r), dot(got, s)
++        det = rr * ss - rs * rs
++        if abs(det) > 0.0:
++            a = (gr * ss - gs * rs) / det
++            b = (gs * rr - gr * rs) / det
++        else:
++            a = b = float("nan")
++
++        def cos(x, y):
++            n = (x.norm() * y.norm()).item()
++            return dot(x, y) / n if n else float("nan")
++
++        rank = dist.get_rank() if dist.is_initialized() else 0
++        logger.info(
++            "[folddbg] rank=%d M=%d scale=%.3f fit a=%.6f b=%.6f | "
++            "cos(got,ref)=%.9f cos(got,routed)=%.9f cos(got,shared)=%.9f | "
++            "norm got=%.4e ref=%.4e routed=%.4e shared=%.4e | "
++            "maxabs(got-ref)=%.4e",
++            rank,
++            hidden_states.shape[0],
++            scale,
++            a,
++            b,
++            cos(got, ref),
++            cos(got, r),
++            cos(got, s),
++            got.norm().item(),
++            ref.norm().item(),
++            r.norm().item(),
++            s.norm().item(),
++            (got - ref).abs().max().item(),
++        )
++
++    @property
++    def _monokernel_folds_shared(self) -> bool:
++        """Does the monokernel path also carry the SHARED half of the output?
++
++        This is the contract that removes the extra collective, and it is worth
++        stating in full because every clause of it is load bearing. When it
++        holds, the op hands back ONE complete MoE output in the routed slot:
++        already summed across the TP group, with routed_scaling_factor already
++        applied, and with the shared half already added in. So the traced side
++        must not reduce a shared output, must not apply the scale, and must not
++        add the two halves. Doing any of them would be a wrong answer, not a
++        slow one.
++
++        WHY IT EXISTS. Folding only the ROUTED reduce into the kernel does not
++        remove a collective from this model, it adds one:
++        _maybe_reduce_shared_expert_output then reduces the shared half alone,
++        at identical shape and identical bytes to the single reduce the baseline
++        did of the sum. MEASURED on DS3 TP=8, that was 5.53% slower at 8192 and
++        3.54% at 16384.
++
++        SIZE-INDEPENDENT BY CONSTRUCTION, for the same reason as
++        _monokernel_reduce_folded: forward() reads it where the token count is
++        symbolic and torch.compile bakes the branch from the first size traced.
++        The per-size part of the decision lives inside the op, where the real M
++        is known, and every branch there ends with exactly one reduction of the
++        sum.
++        """
++        if self._shared_experts is None:
++            return False
++        if not self._monokernel_reduce_folded:
++            return False
++        probe = getattr(
++            self.routed_experts.quant_method, "monokernel_folds_shared_output", None
++        )
++        if probe is None or not probe():
++            return False
++        # Everything the traced side would otherwise put BETWEEN the two halves.
++        # A latent output transform sits between the routed output and the add,
++        # sequence parallelism reduces elsewhere entirely, and fp16 takes the
++        # inverted branch in _maybe_apply_routed_scale_to_output where the scale
++        # lands on the shared half instead. None of the three can be expressed
++        # as one scale inside the kernel, so the fold declines them.
++        return (
++            self.routed_output_transform is None
++            and not self.moe_config.is_sequence_parallel
++            and self.moe_config.in_dtype != torch.float16
++        )
++
+     def _maybe_reduce_shared_expert_output(
+         self,
+         shared_output: torch.Tensor | None,
+@@ -484,7 +745,8 @@ class MoERunner(MoERunnerInterface):
+             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
+             and not output_is_reduced
+         ):
+-            states = tensor_model_parallel_all_reduce(states)
++            with _ep_span("reduce", "moe"):
++                states = tensor_model_parallel_all_reduce(states)
+ 
+         return states[..., :trunc_size] if trunc_size is not None else states
+ 
+@@ -567,6 +829,44 @@ class MoERunner(MoERunnerInterface):
+             assert shared_experts_input is not None
+             self._shared_experts(shared_experts_input, order)
+ 
++    def _maybe_moe_monokernel(
++        self,
++        hidden_states: torch.Tensor,
++        router_logits: torch.Tensor,
++        residual: torch.Tensor | None = None,
++        out_scale: float = 1.0,
++    ) -> torch.Tensor | None:
++        """Offer the work to the standalone prefill MoE monokernel.
++
++        The kernel selects experts itself from the raw router logits, so it has
++        to be offered those logits before select_experts runs and cannot be
++        reached from the modular apply path, which only ever sees weights and
++        ids that routing has already produced. Returning None means "not
++        eligible" and leaves the ordinary paths below untouched.
++
++        The quant method owns the eligibility decision, since that depends on
++        weight geometry and on the backend chosen at load time. The fast path is
++        declined when the modular kernel would run the shared experts inside
++        itself, because bypassing it would then silently drop that work.
++        """
++        quant_method = self.routed_experts.quant_method
++        try_monokernel = getattr(quant_method, "try_moe_monokernel", None)
++        if try_monokernel is None or quant_method.mk_can_overlap_shared_experts:
++            return None
++        if residual is None:
++            # The unchanged call, so a quant method that predates the fold and
++            # takes three arguments is untouched. The extra arguments are only
++            # passed when the fold asked for them, which requires the quant
++            # method to have answered monokernel_folds_shared_output.
++            return try_monokernel(self.routed_experts, hidden_states, router_logits)
++        return try_monokernel(
++            self.routed_experts,
++            hidden_states,
++            router_logits,
++            residual=residual,
++            out_scale=out_scale,
++        )
++
+     def _apply_quant_method(
+         self,
+         hidden_states: torch.Tensor,
+@@ -584,7 +884,34 @@ class MoERunner(MoERunnerInterface):
+             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+         )
+ 
+-        if self.routed_experts.quant_method.is_monolithic:
++        # The shared half, offered to the routed kernel so its own collective
++        # carries the complete MoE output. PEEK rather than pop: the ordinary
++        # consumer below still pops it, so nothing about the op's return
++        # contract changes. At the token counts the fused epilogue accepts, the
++        # shared expert has already run to completion on the main stream in the
++        # call just above, because VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
++        # sends anything wider than 256 tokens down the NO_OVERLAP order. Below
++        # that it runs after the routed kernel and there is nothing to fold
++        # yet, which is a None here and a combine further down.
++        fold_shared = self._monokernel_folds_shared
++        residual: torch.Tensor | None = None
++        out_scale = 1.0
++        if fold_shared:
++            assert self._shared_experts is not None
++            residual = self._shared_experts.pending_output
++            if residual is not None:
++                out_scale = self.routed_scaling_factor
++
++        # Prefill monokernel first, since it routes internally and so has to
++        # see the logits before select_experts consumes them. None means the
++        # kernel declined and the original two branches run unchanged.
++        fused_out = self._maybe_moe_monokernel(
++            hidden_states, router_logits, residual, out_scale
++        )
++
++        if fused_out is not None:
++            pass
++        elif self.routed_experts.quant_method.is_monolithic:
+             # Monolithic kernels: pass router_logits to routed_experts
+             fused_out = self.routed_experts.forward_monolithic(
+                 x=hidden_states,
+@@ -593,28 +920,90 @@ class MoERunner(MoERunnerInterface):
+             )
+         else:
+             # Modular kernels: select experts first, then call routed_experts
+-            topk_weights, topk_ids = self.router.select_experts(
+-                hidden_states=hidden_states,
+-                router_logits=router_logits,
+-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
+-                input_ids=input_ids,
+-            )
+-
+-            fused_out = self.routed_experts.forward_modular(
+-                x=hidden_states,
+-                topk_weights=topk_weights,
+-                topk_ids=topk_ids,
+-                shared_experts=self._shared_experts,
+-                shared_experts_input=shared_experts_input,
+-            )
++            with _ep_span("route", self.layer_name):
++                topk_weights, topk_ids = self.router.select_experts(
++                    hidden_states=hidden_states,
++                    router_logits=router_logits,
++                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
++                    input_ids=input_ids,
++                )
++
++            if _EP_ROUTE_DUMP:
++                _ep_route_record(self.layer_name, topk_ids)
++
++            with _ep_span("layer", self.layer_name):
++                fused_out = self.routed_experts.forward_modular(
++                    x=hidden_states,
++                    topk_weights=topk_weights,
++                    topk_ids=topk_ids,
++                    shared_experts=self._shared_experts,
++                    shared_experts_input=shared_experts_input,
++                )
+ 
+         self._maybe_apply_shared_experts(
+             shared_experts_input,
+             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+         )
+ 
++        # Reduce the routed output here when the monokernel path declares itself
++        # reduced but this particular call did not go through the fused epilogue.
++        # forward() reads that declaration on the traced side with a symbolic
++        # token count, so it cannot vary with M; the sizes the epilogue declines
++        # get their reduce here instead, and _maybe_reduce_final_output skips
++        # one in exchange. Placed after the shared experts are launched so the
++        # collective overlaps their side stream rather than delaying it.
++        shared_out = (
++            self._shared_experts.output if self._shared_experts is not None else None
++        )
++
++        if _FOLD_DEBUG_LEFT > 0 and fold_shared and residual is not None:
++            from vllm.model_executor.layers.fused_moe.monokernel_tp import (
++                output_is_fused as _dbg_is_fused,
++            )
++
++            if _dbg_is_fused(fused_out):
++                self._fold_debug_probe(
++                    hidden_states, router_logits, residual, fused_out
++                )
++
++        if self._monokernel_reduce_folded and not self._fused_output_is_reduced:
++            from vllm.model_executor.layers.fused_moe.monokernel_tp import (
++                output_is_fused,
++            )
++
++            # output_is_fused is the ground truth for whether THIS call went
++            # through the fused epilogue, read from the destination's address
++            # rather than from a flag, so it is correct inside a replayed graph.
++            # The fused epilogue is only entered with a residual in hand
++            # (fused_tp_launch refuses otherwise), so a fused output is a folded
++            # output and the two questions have one answer.
++            was_fused = output_is_fused(fused_out)
++
++            if fold_shared and not was_fused and shared_out is not None:
++                # The kernel took the ordinary path at this token count, so the
++                # two halves are both still partial. Combining them HERE and
++                # reducing the sum once below is the baseline's own shape: one
++                # collective, not two. The scale goes on the routed half only,
++                # which is what _maybe_apply_routed_scale_to_output does and
++                # what the traced side is skipping in exchange.
++                if self.routed_scaling_factor != 1.0:
++                    fused_out = fused_out * self.routed_scaling_factor
++                fused_out = fused_out + shared_out
++            elif fold_shared and was_fused and residual is None:
++                # Structurally unreachable: the fused sizes are far above the
++                # aux-stream threshold, and fused_tp_launch declines without a
++                # residual. Raise rather than add an unreduced shared half to a
++                # reduced routed one, which would be a silent wrong answer.
++                raise RuntimeError(
++                    "the fused MoE epilogue ran without the shared half folded "
++                    "in; the shared output was not available at launch"
++                )
++
++            if not was_fused:
++                fused_out = tensor_model_parallel_all_reduce(fused_out)
++
+         return (
+-            self._shared_experts.output if self._shared_experts is not None else None,
++            shared_out,
+             fused_out,
+         )
+ 
+@@ -711,6 +1100,13 @@ class MoERunner(MoERunnerInterface):
+             )
+         )
+ 
++        # rmoe: the one span that means the same thing in all four campaign arms,
++        # namely router logits in hand through to the complete reduced MoE output. It
++        # has to start here, outside _forward_entry, because the monokernel arm does
++        # its routing, its expert work and its output collective inside that single
++        # call.
++        if _EP_TIME_ON:
++            _ep_begin("rmoe", self.layer_name)
+         result = self._forward_entry(
+             hidden_states,
+             router_logits,
+@@ -737,7 +1133,28 @@ class MoERunner(MoERunnerInterface):
+         if og_hidden_dim_pre_xform is not None:
+             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+ 
+-        fused_output_is_reduced = self._fused_output_is_reduced
++        if self._monokernel_folds_shared:
++            # The op folded the shared half into the routed kernel's epilogue
++            # and reduced the sum once, so what came back in the routed slot is
++            # already the complete MoE output. The shared slot still holds the
++            # tensor the op computed, because the op's fake declares two tensors
++            # and the compiled graph is built from that declaration; it is
++            # DROPPED here rather than reduced, scaled and added a second time.
++            if og_hidden_dim_pre_xform is not None:
++                raise RuntimeError(
++                    "the shared-expert fold cannot be combined with a padded "
++                    "routed hidden dim: the kernel added the two halves at full "
++                    "width before the truncation point"
++                )
++            shared_output = None
++
++        # _monokernel_reduce_folded is the monokernel path's own claim, and it
++        # is deliberately not a function of the token count: see
++        # Fp8MoEMethod.monokernel_output_is_reduced. Whichever branch ran inside
++        # the op, the routed output is reduced by the time it gets here.
++        fused_output_is_reduced = (
++            self._fused_output_is_reduced or self._monokernel_reduce_folded
++        )
+ 
+         # Latent routed output has to be reduced before output transform,
+         # because the transform may include non-linear normalization.
+@@ -754,9 +1171,13 @@ class MoERunner(MoERunnerInterface):
+             shared_output, fused_output_is_reduced
+         )
+ 
+-        shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
+-            shared_output, fused_output
+-        )
++        if not self._monokernel_folds_shared:
++            # Under the fold the scale was already applied, in fp32 inside the
++            # kernel's Phase-3 store and before the round to bf16. Applying it
++            # again here would double the routed half.
++            shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
++                shared_output, fused_output
++            )
+ 
+         # Apply output transform (e.g. latent -> full dim)
+         fused_output = self.apply_routed_output_transform(fused_output)
+@@ -769,6 +1190,11 @@ class MoERunner(MoERunnerInterface):
+         result = self._maybe_reduce_final_output(
+             result, og_hidden_dim_post_xform, fused_output_is_reduced
+         )
++        # Closed after the reduce, so the arms that pay an external all-reduce are
++        # charged for it and the arm that folds it into Phase 3 shows the saving
++        # instead of hiding it.
++        if _EP_TIME_ON:
++            _ep_end()
+ 
+         return self._maybe_add_zero_expert_output(result)
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index 17faeff..c9618ee 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -155,6 +155,21 @@ class SharedExperts(torch.nn.Module):
+     def _output_idx(self) -> int:
+         return dbo_current_ubatch_id() if self.enable_dbo else 0
+ 
++    @property
++    def pending_output(self) -> torch.Tensor | None:
++        """The output WITHOUT consuming it, or None if it has not run yet.
++
++        `output` pops, which is what a single consumer wants. The fused MoE
++        epilogue has to read the shared half BEFORE the routed kernel launches,
++        and the ordinary consumer still pops it afterwards, so the peek is a
++        separate accessor rather than a flag on `output`.
++
++        None here is a real answer and not a failure: on the aux-stream order
++        the shared experts run after the routed kernel, so at that point there
++        is nothing to fold and the caller combines the two halves itself.
++        """
++        return self._output[self._output_idx]
++
+     @property
+     def output(self) -> torch.Tensor:
+         assert self._output[self._output_idx] is not None
+diff --git a/vllm/model_executor/layers/fused_moe/symm_output_pool.py b/vllm/model_executor/layers/fused_moe/symm_output_pool.py
+new file mode 100644
+index 0000000..2cef880
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/symm_output_pool.py
+@@ -0,0 +1,199 @@
++#!/usr/bin/env python3
++"""A persistent symmetric output pool for the fused MoE epilogue.
++
++WHAT THIS REPLACES. The harness allocated one symmetric buffer per token size and
++rendezvoused each of them by hand:
++
++    b = sm.empty(t * H_DIM, device=DEV, dtype=torch.bfloat16)
++    h = sm.rendezvous(b, gname)
++
++That is fine for a benchmark that knows its four shapes up front and never frees
++anything, and unusable from an engine for three separate reasons:
++
++  1. sm.rendezvous is a COLLECTIVE. It cannot run inside CUDA graph capture, and
++     it cannot run on the per-request path at all, because a rank that reaches it
++     while a peer does not deadlocks.
++  2. A graph bakes the output pointer as a kernel argument. A per-call
++     torch.empty hands back a different address on the next call, so a replay
++     would reduce into freed memory. The buffer has to outlive every graph that
++     captured it.
++  3. Prefill token counts are not a small fixed set. Chunked prefill produces any
++     M up to max_num_batched_tokens, so a shape-keyed table needs a miss path,
++     and the miss path cannot rendezvous.
++
++THE POLICY: ONE MAXIMUM-SIZE BUFFER PER SLOT, USED FROM OFFSET 0.
++
++Rejected alternatives and why:
++
++  a per-shape pool
++      needs a rank-uniform shape table plus a miss path that cannot allocate, and
++      buys nothing: the buffer is written [0, M*H) either way.
++  one buffer with slots carved out at byte offsets
++      makes every slot's alignment depend on the slot stride. 512-BYTE SHARD
++      ALIGNMENT IS THE DOMINANT REDUCE LEVER (MEASURED), so alignment must not be
++      a function of a size constant someone may later change. Separate
++      allocations per slot keep every launch at offset 0 of its own allocation,
++      where the symmetric allocator's own alignment applies.
++  sizing to the largest captured shape
++      prefill is not limited to captured shapes.
++
++So each slot is its own sm.empty of max_tokens * hidden, and a launch of M tokens
++uses the first M * hidden elements. Every shape therefore starts at the same
++aligned base, and the 512-byte shard property that the reduce depends on holds
++identically at 512 and at 16384 with no per-shape reasoning.
++
++MEASURED on 8 x H200 before any of this was wired up, because both facts had to
++hold for the policy to work at all:
++  - every slot's base pointer AND its multicast pointer come back 512-byte
++    aligned, so offset 0 is aligned for every shape (0x1002fc00a00 and
++    0xdc4fc00a00, both %512 == 0; slot 1 likewise).
++  - torch's multimem_all_reduce_ accepts a PREFIX of a larger symmetric
++    allocation, at 512 / 2048 / 8192 / 16384 tokens, with correct values. So the
++    reference collective runs on the same pool view the fused path writes and the
++    comparison needs no second buffer.
++
++HOW MANY SLOTS. One, unless the engine runs more than one microbatch in flight.
++In this tree that is ParallelConfig.enable_dbo (default False) and
++ParallelConfig.num_ubatches, which returns 2 when DBO is on. DBO alternates two
++microbatches across a compute and a comm stream, so both can have an MoE output
++live at once and one buffer would race. nslots is therefore not decoration: it
++must equal num_ubatches, and the slot index must come from the ubatch id, which
++is rank-uniform. Everything else in the serving path is single-flight: layer L's
++MoE output is consumed by the residual add before layer L+1's MoE runs, on the
++same stream, so stream ordering alone makes reuse safe without any host sync.
++
++WHAT IS NOT IN HERE, DELIBERATELY. The barrier pad window and the graph-safe
++sequence counter have exactly the same lifetime requirement as the output buffer,
++so they are created here too and nowhere else. The counter is a plain device
++tensor rather than symmetric memory because it is rank-local by design; see the
++kernel comment on tp_seqctr. Nothing in this class is touched on the hot path:
++pointers are read once at construction, views are cached, and there is no
++allocation, no collective, and no synchronize after __init__ returns.
++"""
++
++import torch
++import torch.distributed._symmetric_memory as sm
++
++
++class SymmOutputPool:
++    """Persistent symmetric output buffers plus the fused epilogue's coordination
++    state. Construct once during initialization or warmup, never per call.
++    """
++
++    def __init__(
++        self,
++        group_name,
++        max_tokens,
++        hidden,
++        pad_words,
++        *,
++        nslots=1,
++        dtype=torch.bfloat16,
++        device=None,
++    ):
++        assert nslots >= 1
++        self.group_name = group_name
++        self.max_tokens = int(max_tokens)
++        self.hidden = int(hidden)
++        self.nslots = int(nslots)
++        self.dtype = dtype
++        self.device = device or torch.cuda.current_device()
++
++        n = self.max_tokens * self.hidden
++        # Both the tensor and the handle are retained. Dropping the handle can
++        # release the multicast mapping while a baked graph still points at it,
++        # which is a use-after-free the kernel cannot detect.
++        self._bufs, self._handles, self._mc, self._base = [], [], [], []
++        for _ in range(self.nslots):
++            b = sm.empty(n, device=self.device, dtype=dtype)
++            h = sm.rendezvous(b, group_name)
++            mc = h.multicast_ptr
++            if not mc:
++                raise RuntimeError(
++                    "symmetric allocation has no multicast "
++                    "pointer; the fused reduce needs one"
++                )
++            self._bufs.append(b)
++            self._handles.append(h)
++            self._mc.append(int(mc))
++            self._base.append(int(b.data_ptr()))
++
++        # pad_words comes from the binary's own prefill_wgmma_tp_pad_words at the
++        # widest legal configuration, not from the formula rewritten here. A pool
++        # that derives the size itself is a second source of truth and the two
++        # drift the moment the kernel's pad layout changes.
++        self.pad_words = int(pad_words)
++        self._flags = sm.empty(self.pad_words, device=self.device, dtype=torch.int32)
++        self._flags_handle = sm.rendezvous(self._flags, group_name)
++        # Zeroed once. The pads are never cleared again: the graph-safe sequence
++        # is monotone, so a stale pad value below the current sequence can only
++        # make a barrier wait, never release early.
++        self._flags.zero_()
++        self.pads_ptr = int(self._flags_handle.buffer_ptrs_dev)
++
++        # Persistent device sequence counter, outside every workspace because the
++        # launcher memsets its workspace on every launch and a graph replays that
++        # memset. Zeroed once here and never written from the host again.
++        self._seqctr = torch.zeros(1, device=self.device, dtype=torch.int32)
++        self.seqctr_ptr = int(self._seqctr.data_ptr())
++
++        # Cached views, so the hot path does not even build a Python tensor.
++        self._views = {}
++        # Recorded for assert_stable(). A pointer that moves means something
++        # freed a buffer a captured graph still refers to.
++        self._fingerprint = (
++            tuple(self._base),
++            tuple(self._mc),
++            self.pads_ptr,
++            self.seqctr_ptr,
++        )
++
++    def output(self, num_tokens, slot=0):
++        """The [num_tokens, hidden] view a launch writes. Offset 0, always."""
++        key = (slot, num_tokens)
++        v = self._views.get(key)
++        if v is None:
++            if num_tokens > self.max_tokens:
++                raise ValueError(
++                    f"{num_tokens} tokens exceeds pool max {self.max_tokens}"
++                )
++            v = self._bufs[slot][: num_tokens * self.hidden].view(
++                num_tokens, self.hidden
++            )
++            self._views[key] = v
++        return v
++
++    def mc_ptr(self, slot=0):
++        return self._mc[slot]
++
++    def slot_buffer(self, slot=0):
++        """The WHOLE slot allocation. Only a test needs this: it is how the range
++        discipline is checked, by seeding the bytes past num_tokens * hidden and
++        proving a launch leaves them alone."""
++        return self._bufs[slot]
++
++    def base_ptr(self, slot=0):
++        return self._base[slot]
++
++    def assert_stable(self):
++        """Every pointer a graph may have baked is still the one we published."""
++        now = (
++            tuple(int(b.data_ptr()) for b in self._bufs),
++            tuple(int(h.multicast_ptr) for h in self._handles),
++            int(self._flags_handle.buffer_ptrs_dev),
++            int(self._seqctr.data_ptr()),
++        )
++        if now != self._fingerprint:
++            raise RuntimeError(f"pool pointers moved: {self._fingerprint} -> {now}")
++
++    def bytes_per_slot(self):
++        return self.max_tokens * self.hidden * self._bufs[0].element_size()
++
++    def describe(self):
++        return (
++            f"slots={self.nslots} max_tokens={self.max_tokens} "
++            f"hidden={self.hidden} bytes/slot={self.bytes_per_slot()} "
++            f"pad_words={self.pad_words} "
++            f"base0=0x{self._base[0]:x} mc0=0x{self._mc[0]:x} "
++            f"base0%512={self._base[0] % 512} mc0%512={self._mc[0] % 512}"
++        )
+diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
+index 9c69ff9..46b6fd1 100644
+--- a/vllm/model_executor/layers/quantization/fp8.py
++++ b/vllm/model_executor/layers/quantization/fp8.py
+@@ -496,6 +496,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+             )
+ 
+         # Select Fp8 MoE backend
++        # Whether this layer is eligible for the MoE monokernel fast path.
++        # Decided after weight loading, in process_weights_after_loading.
++        self._use_moe_monokernel = False
++
++        # Captured here, not inside a forward: the fused TP gate needs values
++        # that are identical on every rank, and VllmConfig is the one place they
++        # are guaranteed to be. max_num_batched_tokens sizes the persistent
++        # output pool; num_ubatches is how many MoE outputs can be live at once
++        # and therefore how many pool slots there must be.
++        _vc = get_current_vllm_config()
++        self._mk_max_num_batched_tokens = int(
++            _vc.scheduler_config.max_num_batched_tokens
++        )
++        self._mk_num_ubatches = int(_vc.parallel_config.num_ubatches)
++
+         self.fp8_backend, self.experts_cls = select_fp8_moe_backend(
+             config=self.moe,
+             weight_key=weight_key,
+@@ -737,6 +752,219 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+             layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
+         )
+ 
++        # Decide monokernel eligibility now that the weights are final. The
++        # kernel consumes raw block-wise FP8 weights, so only the TRITON
++        # backend qualifies; backends like DEEPGEMM repack them. The shape
++        # test is the Qwen3.5 expert geometry the kernel is compiled for.
++        # Gated by VLLM_USE_MOE_MONOKERNEL (default on); set it to 0 to force
++        # the standard TRITON fused-MoE backend for A/B benchmarking.
++        from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
++
++        self._use_moe_monokernel = False
++        self._moe_monokernel_bias = None
++        # True when this rank holds a strict subset of the global experts and the
++        # loaded .so is the EP build. It selects the EP entry point at call time,
++        # and it is decided once here rather than re-derived per call so the
++        # decision that was validated is the decision that runs.
++        self._moe_monokernel_ep = False
++        eligible = (
++            envs.VLLM_USE_MOE_MONOKERNEL
++            and self.block_quant
++            and self.fp8_backend == Fp8MoeBackend.TRITON
++            and getattr(layer, "top_k", 1) > 1
++        )
++        if eligible:
++            from vllm import _custom_ops as ops
++
++            # Ask the binary what it was built for instead of hardcoding one
++            # model's geometry. Every field the .so reports has to match the
++            # layer, because the kernel indexes its weights from compile-time
++            # constants: a shape it was not built for is read at the wrong
++            # stride and still returns rc=0, which is a wrong answer rather
++            # than a failure.
++            try:
++                geo = ops.prefill_monokernel_geometry()
++            except Exception as exc:
++                logger.info(
++                    "MoE monokernel unavailable, could not read geometry "
++                    "off the .so (%s)",
++                    exc,
++                )
++                geo = None
++
++            if geo is not None:
++                want = {
++                    "num_experts": getattr(layer, "global_num_experts", 0),
++                    "top_k": getattr(layer, "top_k", 0),
++                    "k_dim": layer.w13_weight.size(2),
++                    "n_up": layer.w13_weight.size(1),
++                    "n_half": layer.w2_weight.size(2),
++                    "h_dim": layer.w2_weight.size(1),
++                }
++                # The .so reports ONE expert count, and it is used both to score
++                # the router and to index the weight table, so it has to match
++                # the global routing width AND the number of local weight slabs.
++                # Those are the same number with EP off and differ under EP
++                # (256 global against 32 local on an 8-rank node), and only the
++                # global one was compared. A build at the EP width therefore
++                # satisfied every checked field while being compiled to index
++                # 256 slabs out of a 32-slab tensor, which is the wrong-stride
++                # read the comment above warns about rather than a decline.
++                local_experts = layer.w13_weight.size(0)
++                want["num_experts_local"] = local_experts
++                # A .so that cannot report a local count has no EP path: its
++                # weight indexing is compiled against the global count. Mirroring
++                # the global count here is what turns an EP-shaped weight tensor
++                # into a MISMATCH instead of an unchecked assumption. A build that
++                # DOES export the symbol reports its real value and is compared
++                # against it.
++                if (
++                    geo.get("num_experts_local") is None
++                    and geo.get("num_experts") is not None
++                ):
++                    geo = dict(geo)
++                    geo["num_experts_local"] = geo["num_experts"]
++                # A None means this .so predates the symbol, so it cannot be
++                # checked and is not treated as a mismatch.
++                mismatch = {
++                    k: (geo.get(k), v)
++                    for k, v in want.items()
++                    if geo.get(k) is not None and geo[k] != v
++                }
++
++                # EXPERT PARALLELISM. Under EP the router still scores every
++                # global expert while only this rank's slabs are resident, so the
++                # kernel needs vLLM's own global->local map and a build whose
++                # weight indexing, TMA extents and tile ownership are all local.
++                # Both are checked HERE, at weight load, and not at the call:
++                # once the persistent kernel is entered it holds every SM and its
++                # grid barrier means one wrong rank wedges its peers instead of
++                # failing alone. There is no safe post-entry fallback.
++                ep_needed = local_experts != want["num_experts"]
++                ep_capable = bool(geo.get("ep_capable") or 0)
++                emap = getattr(layer, "expert_map", None) if ep_needed else None
++                ep_reason = None
++                if ep_needed and not ep_capable:
++                    ep_reason = (
++                        f"weights are EP shaped ({local_experts} local of "
++                        f"{want['num_experts']} global) but the .so is not EP "
++                        "capable"
++                    )
++                elif ep_capable and not ep_needed:
++                    ep_reason = (
++                        "the .so is an EP build but the weights hold every "
++                        "global expert"
++                    )
++                elif ep_needed:
++                    # Prove the tensor is the canonical -1/local-slot map rather
++                    # than the 0/1 expert_mask the AITER kernels consume. The two
++                    # have the same dtype and length, and reading the mask as a
++                    # map would send every owned token to local slot 1.
++                    if emap is None:
++                        ep_reason = "layer exposes no expert_map"
++                    elif emap.dtype != torch.int32:
++                        ep_reason = f"expert_map dtype is {emap.dtype}, not int32"
++                    elif emap.numel() != want["num_experts"]:
++                        ep_reason = (
++                            f"expert_map has {emap.numel()} entries, expected "
++                            f"{want['num_experts']}"
++                        )
++                    else:
++                        owned = int((emap >= 0).sum().item())
++                        top = int(emap.max().item())
++                        if owned != local_experts or top != local_experts - 1:
++                            ep_reason = (
++                                f"expert_map is not a global->local map: "
++                                f"{owned} non-negative entries with max {top}, "
++                                f"expected {local_experts} and "
++                                f"{local_experts - 1}"
++                            )
++                if ep_reason is not None:
++                    logger.info("MoE monokernel DECLINED: %s", ep_reason)
++                    mismatch = dict(mismatch)
++                    mismatch["ep"] = ep_reason
++
++                # Scoring function. Mode 0 is softmax over the logits; modes 1
++                # and 2 are sigmoid with a per-expert correction bias used for
++                # selection only. Neither substitutes for the other, and the
++                # difference is invisible in the weight shapes, so it is
++                # checked explicitly rather than assumed.
++                mode = geo.get("router_mode")
++                scoring = getattr(layer, "scoring_func", "softmax")
++                bias = getattr(layer, "e_score_correction_bias", None)
++                if bias is not None and hasattr(bias, "data"):
++                    bias = bias.data
++                router_ok = True
++                if (mode == 0 and scoring != "softmax") or (
++                    mode in (1, 2) and scoring != "sigmoid"
++                ):
++                    router_ok = False
++                elif mode in (1, 2) and bias is None:
++                    # A sigmoid build with no bias would score every expert
++                    # unbiased, which is not this model's routing either.
++                    router_ok = False
++
++                if mismatch or not router_ok:
++                    logger.info(
++                        "MoE monokernel DECLINED: geometry mismatch %s, "
++                        "router_mode=%s scoring_func=%s bias=%s",
++                        mismatch or "none",
++                        mode,
++                        scoring,
++                        "present" if bias is not None else "absent",
++                    )
++                else:
++                    self._use_moe_monokernel = True
++                    self._moe_monokernel_bias = bias
++                    self._moe_monokernel_ep = ep_needed
++                    logger.info(
++                        "MoE monokernel fast path ENABLED (E=%s, E_LOCAL=%s, "
++                        "ep=%s, N_UP=%s, N_HALF=%s, K=%s, H=%s, top_k=%s, "
++                        "router_mode=%s, scoring=%s, backend=%s)",
++                        want["num_experts"],
++                        local_experts,
++                        int(ep_needed),
++                        want["n_up"],
++                        want["n_half"],
++                        want["k_dim"],
++                        want["h_dim"],
++                        want["top_k"],
++                        mode,
++                        scoring,
++                        self.fp8_backend,
++                    )
++                    # Build the fused TP plan HERE, while this is still ordinary
++                    # eager Python on every rank. Its first call votes across the
++                    # TP group and rendezvouses symmetric memory, and neither
++                    # collective survives being reached later: a symmetric
++                    # allocation cannot happen inside a CUDA graph capture, and
++                    # the first reader of monokernel_output_is_reduced is
++                    # MoERunner.forward on the Dynamo-traced side, which would
++                    # trace the vote instead of running it. At this point the TP
++                    # group is live, _setup_kernel has already run, and every
++                    # rank arrives at the same layer in the same order. Later
++                    # calls hit the module cache and take no collective.
++                    if self._fused_tp_eligible():
++                        from vllm.model_executor.layers.fused_moe.monokernel_tp import (  # noqa: E501
++                            fused_tp_plan,
++                        )
++
++                        _tp_plan = fused_tp_plan(
++                            self.moe.hidden_dim,
++                            self._mk_max_num_batched_tokens,
++                            self._mk_num_ubatches,
++                        )
++                        logger.info_once(
++                            "fused TP MoE prefill plan built at weight load: "
++                            "usable=%s fold_shared=%s reason=%s tokens=%s "
++                            "slots=%s",
++                            _tp_plan.usable,
++                            _tp_plan.fold_shared,
++                            _tp_plan.reason,
++                            self._mk_max_num_batched_tokens,
++                            _tp_plan.nslots,
++                        )
++
+     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+         w1_scale = getattr(layer, f"w13_{self.weight_scale_name}")
+         w2_scale = getattr(layer, f"w2_{self.weight_scale_name}")
+@@ -772,6 +1000,181 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+     def supports_eplb(self) -> bool:
+         return True
+ 
++    def _fused_tp_eligible(self) -> bool:
++        """May this layer take the fused tensor-parallel epilogue at all?
++
++        ONE PLACE, because the two callers must never disagree and the failure
++        mode of disagreement is a double reduce: the epilogue hands back an
++        output already summed across the group, so a caller that believes it is
++        not reduced adds a second all-reduce and scales the activations by the
++        world size. The callers are monokernel_output_is_reduced, which tells the
++        runner the reduce is folded in, and try_moe_monokernel, which decides
++        whether to enter the epilogue.
++
++        RANK-UNIFORM BY CONSTRUCTION. Every input is either configuration, built
++        once and handed to every worker, or the load-time monokernel
++        eligibility, which is a geometry check over replicated weights. Nothing
++        here is a function of the token count or of anything one rank observes
++        alone.
++        """
++        if not getattr(self, "_use_moe_monokernel", False):
++            return False
++        # Mirrors the decline in MoERunner._maybe_moe_monokernel: when the
++        # modular kernel runs the shared experts itself the monokernel is never
++        # offered the work, so nothing on this path is reduced.
++        if self.mk_can_overlap_shared_experts:
++            return False
++        # skip_final_all_reduce means the model reduces the MoE output itself
++        # later, so entering the epilogue there would double-reduce.
++        return self.moe.tp_size >= 2 and not self.moe.skip_final_all_reduce
++
++    def monokernel_folds_shared_output(self) -> bool:
++        """Does the fused epilogue also carry the shared expert output?
++
++        Read by MoERunner._monokernel_folds_shared, which is the predicate that
++        stops the runner reducing, scaling and adding the shared half a second
++        time. SIZE-INDEPENDENT and RANK-UNIFORM for the same reasons as
++        monokernel_output_is_reduced: the answer is the plan's fold_shared,
++        which is one element of the same MIN all-reduce over the TP group that
++        decided usable, so no rank can fold while a peer does not.
++        """
++        from vllm.model_executor.layers.fused_moe.monokernel_tp import (
++            fused_tp_plan,
++        )
++
++        if not self._fused_tp_eligible():
++            return False
++        plan = fused_tp_plan(
++            self.moe.hidden_dim,
++            getattr(self, "_mk_max_num_batched_tokens", 0),
++            getattr(self, "_mk_num_ubatches", 1),
++        )
++        return bool(plan.usable and plan.fold_shared)
++
++    def monokernel_output_is_reduced(self) -> bool:
++        """Does the monokernel path hand back an already TP-reduced output?
++
++        SIZE-INDEPENDENT BY CONSTRUCTION, and that is the point rather than a
++        simplification. MoERunner.forward reads this on the traced side, where
++        the token count is symbolic and torch.compile will specialize the branch
++        once. A per-size answer would be baked from the first size traced and
++        then be wrong for every other one. So this says yes for the whole
++        monokernel path and the reduce is folded in for the sizes the fused
++        epilogue declines, instead of varying with M.
++
++        RANK-UNIFORM BY CONSTRUCTION. tp_size, skip_final_all_reduce and the
++        load-time monokernel eligibility all come from the config, which is
++        built once and handed to every worker. plan.usable is the result of a
++        MIN all-reduce over the TP group. The enable environment variable is
++        never read here: it reaches this only through that vote.
++
++        Returns False when skip_final_all_reduce is set, because there the model
++        reduces the MoE output itself later and a fold would double-reduce.
++        """
++        from vllm.model_executor.layers.fused_moe.monokernel_tp import (
++            fused_tp_plan,
++        )
++
++        if not self._fused_tp_eligible():
++            return False
++        plan = fused_tp_plan(
++            # hidden_dim, not w2_weight.size(1): both are 7168 on DS3, and this
++            # one is available without a layer and is the value the pool is
++            # sized from everywhere else.
++            self.moe.hidden_dim,
++            getattr(self, "_mk_max_num_batched_tokens", 0),
++            getattr(self, "_mk_num_ubatches", 1),
++        )
++        return bool(plan.usable)
++
++    def try_moe_monokernel(
++        self,
++        layer: RoutedExperts,
++        x: torch.Tensor,
++        router_logits: torch.Tensor,
++        residual: torch.Tensor | None = None,
++        out_scale: float = 1.0,
++    ) -> torch.Tensor | None:
++        """Run the standalone prefill MoE monokernel, or return None to decline.
++
++        Eligibility was decided at weight load time in
++        process_weights_after_loading, where the expert geometry and the chosen
++        FP8 backend are both final. The remaining test here is the token count,
++        which has to be per call: the kernel serves a batch only up to the tile
++        cap its binary was built for, and above that the standard path is
++        correct and this returns None. A launch failure is treated the same way,
++        so a fallback is always available and never a silent wrong answer.
++
++        The fused tensor-parallel path is the one exception to that last
++        sentence and is therefore kept OUT of the try/except below. Its epilogue
++        is a collective: a rank that caught an error and returned None would
++        leave its peers spinning on a barrier no one will ever arrive at. Its
++        eligibility is agreed across the TP group before entry instead, and once
++        entered it does not fall back. See fused_moe/monokernel_tp.py.
++        """
++        from vllm import _custom_ops as ops
++        from vllm.model_executor.layers.fused_moe.monokernel_tp import (
++            fused_tp_launch,
++        )
++
++        if not getattr(self, "_use_moe_monokernel", False):
++            return None
++        if x.size(0) > ops.MOE_MONOKERNEL_PREFILL_MAX_TOKENS:
++            return None
++
++        # The same predicate the fold reads. Entering the epilogue while the
++        # runner believes the output is unreduced, or the reverse, is a wrong
++        # answer rather than a slow one, so there is only one of it.
++        fused = (
++            fused_tp_launch(
++                x,
++                router_logits,
++                layer,
++                self.weight_scale_name,
++                self._moe_monokernel_bias,
++                # getattr, not attribute access: a quant method built outside a
++                # VllmConfig context has neither, and 0 tokens makes the gate
++                # refuse rather than raise.
++                getattr(self, "_mk_max_num_batched_tokens", 0),
++                getattr(self, "_mk_num_ubatches", 1),
++                # Only the fused epilogue can carry these. The ordinary
++                # monokernel below is left exactly as it was, so a token count
++                # the epilogue declines produces an unfolded partial output and
++                # the runner combines the halves itself.
++                residual,
++                out_scale,
++            )
++            if self._fused_tp_eligible()
++            else None
++        )
++        if fused is not None:
++            return fused
++
++        try:
++            return torch.ops.vllm.moe_monokernel_prefill(
++                x,
++                router_logits,
++                layer.w13_weight,
++                getattr(layer, f"w13_{self.weight_scale_name}"),
++                layer.w2_weight,
++                getattr(layer, f"w2_{self.weight_scale_name}"),
++                layer.top_k,
++                getattr(layer, "renormalize", True),
++                self._moe_monokernel_bias,
++                # None under TP, which is the shipped call unchanged. Under EP
++                # this is vLLM's own global->local map, already validated against
++                # the binary at weight load; the kernel returns this rank's
++                # PARTIAL sum and MoERunner performs the cross-rank reduce
++                # because MoEPrepareAndFinalizeNoDPEPModular.output_is_reduced()
++                # is False.
++                layer.expert_map if self._moe_monokernel_ep else None,
++            )
++        except RuntimeError as e:
++            logger.warning_once(
++                "prefill monokernel failed (%s); falling back to Triton", e
++            )
++            return None
++
+     def apply_monolithic(
+         self,
+         layer: RoutedExperts,
+@@ -781,6 +1184,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+     ) -> torch.Tensor:
+         assert self.is_monolithic
+         assert self.moe_kernel is not None
++
++        fused_out = self.try_moe_monokernel(layer, x, router_logits)
++        if fused_out is not None:
++            return fused_out
++
+         return self.moe_kernel.apply_monolithic(
+             x,
+             layer.w13_weight,
