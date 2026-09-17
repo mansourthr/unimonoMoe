@@ -45,7 +45,7 @@ DeepSeek EP, which is not the persistent kernel:
 | File | What was added |
 |---|---|
 | `fused_moe/experts/triton_moe.py` | The two EP switches on the Triton expert path: `_ep_ragged_enabled` (the ragged expert GEMM grid, both halves or neither) and `_ep_fast_silu_mode` with its readback. |
-| `fused_moe/fast_silu_quant.py` | The pad-aware fused SiLU-and-mul plus per-block FP8 quantize kernel. Skips rows the rank does not own instead of computing and discarding them. `_supported` is the shape guard. |
+| `fused_moe/fast_silu_quant.py` | The pad-aware fused SiLU-and-mul plus per-block FP8 quantize kernel. Skips rows the rank does not own instead of computing and discarding them. `_supported` is the shape guard. Its gate is `validation/ep_silu_gate.py`. |
 | `distributed/device_communicators/all2all.py` | `DeepEPHTAll2AllManager.num_sms`, the DeepEP communication SM count, line 178. 20 is the DeepEP default, 32 is the measured shipping value. |
 | `prepare_finalize/deepep_ht.py` | Dispatch and combine instrumentation, plus the top-k compaction experiment (`VLLM_EP_TOPK_COMPACT`) and the worst-case-width path. The compaction result was negative and the switch defaults off. |
 | `prepare_finalize/naive_dp_ep.py` | Timing spans on the AgRs (all-gather / reduce-scatter) EP path, which is the only EP backend that runs on this box besides DeepEP. |

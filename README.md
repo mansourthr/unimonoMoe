@@ -78,7 +78,7 @@ validation/
   tp8_soak.py                   adversarial soak on the fused epilogue
   tp8_fold_gate.py              shared-expert fold correctness
   ep4_acc.py                    Qwen EP kernel vs an fp64 oracle, ranks in sequence
-  ds3_acc.py                    DeepSeek EP kernel vs an fp64 oracle, ranks in sequence
+  ep_silu_gate.py               pad-aware activation, both grids, DeepSeek EP path
 docs/
   CODE_MAP.md                   where to look, one line per file
   FLASHINFER_UPSTREAM_NOTES.md  what upstreaming the kernel would involve
@@ -147,9 +147,14 @@ this vLLM runtime: under `enable_expert_parallel` the MoE config sets
 
 Diagnostics, all off by default and none of them on a measured path:
 `VLLM_EP_TIME_DUMP`, `VLLM_EP_ROUTE_DUMP`, `VLLM_EP_ROUTE_EPHYS`,
-`VLLM_EP_TOPK_COMPACT`, `VLLM_EP_CG_WORST`, `VLLM_EP_PHASE2`,
-`VLLM_EP_COMB_BARRIER`, `VLLM_EP_DEEPEP_SYNC`, `VLLM_EP_RS_CONTROL`,
-`VLLM_PREFILL_MONOKERNEL_TP_FOLD_DEBUG`.
+`VLLM_EP_PHASE2`, `VLLM_EP_COMB_BARRIER`, `VLLM_EP_DEEPEP_SYNC`,
+`VLLM_EP_RS_CONTROL`, `VLLM_PREFILL_MONOKERNEL_TP_FOLD_DEBUG`.
+
+Rejected experiments, kept so the measurement can be repeated rather than because
+they are useful. Both are off by default and neither is on a shipped path:
+`VLLM_EP_TOPK_COMPACT` (compacting the top-k slots before dispatch, which was a
+regression) and `VLLM_EP_CG_WORST` (a worst-case-width dispatch for CUDA graph
+capture).
 
 ## Build and run
 
@@ -216,16 +221,27 @@ Geometry, no GPU needed:
 python3 validation/geo_readback.py kernel/deepseek_tp/build/libprefill_mono.so
 ```
 
-Correctness against an fp64 oracle, single GPU, ranks run in sequence so a fault
-is attributable to one rank:
+The Qwen EP kernel against an fp64 oracle, single GPU, ranks run in sequence so a
+fault is attributable to one rank:
 
 ```
 QWEN_CKPT=<snapshot> EPSO=kernel/qwen_ep/build/libprefill_mono.so \
   python3 validation/ep4_acc.py
-
-DS3CKPT=<snapshot> EPSO=<DeepSeek EP build> CTLSO=<full-width control build> \
-  python3 validation/ds3_acc.py
 ```
+
+The shipped DeepSeek EP path, which is the pad-aware activation and the two expert
+GEMM grids rather than the persistent kernel. No checkpoint and no `.so` are needed;
+it builds its own weights and compares the bf16 output of the whole composition
+bitwise, then poisons the skipped and the written rows in turn to show the
+comparison is not vacuous:
+
+```
+TREE=<path to vllm source tree> python3 validation/ep_silu_gate.py
+```
+
+The gate for the archived DeepSeek EP persistent-kernel experiment is
+`research_archive/ds3_acc.py`. It belongs to that experiment, which was a negative
+result, and it does not gate the shipped DeepSeek EP path.
 
 The fused TP epilogue, 8 ranks:
 
@@ -240,9 +256,9 @@ SO_SHIP=<unfused build> SO_FOLD=<fold build> \
   torchrun --nproc_per_node=8 validation/tp8_fold_gate.py
 ```
 
-`SO_SHIP`, `SO_FOLD` and `CTLSO` are earlier compiles of the same source with the
-feature under test disabled. They are required rather than defaulted, because a
-gate that silently loaded the wrong side would still print a pass.
+`SO_SHIP` and `SO_FOLD` are earlier compiles of the same source with the feature
+under test disabled. They are required rather than defaulted, because a gate that
+silently loaded the wrong side would still print a pass.
 
 ## Status
 

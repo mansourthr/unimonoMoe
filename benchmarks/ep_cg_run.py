@@ -1,8 +1,9 @@
 """Real vLLM serving boot for the EP CUDA-graph validation, with capture/replay EVIDENCE.
 
-WHY THIS IS A SEPARATE RUNNER. Every shipping EP number (8192 316.1 ms, 16384 631.0 ms) was
-produced by the plain eager-mode runner, which was therefore frozen rather than edited. This
-file is derived from it and adds exactly three things:
+WHY THIS IS A SEPARATE RUNNER. The eager EP anchors this validation is scored against
+(8192 316.1 ms, 16384 631.0 ms) were produced by the plain eager-mode runner, which was
+therefore frozen rather than edited. This file is derived from it and adds exactly three
+things:
 
   1. CGSIZES, so `cudagraph_capture_sizes` can be set to include the BENCHMARK shape.
   2. a post-boot evidence readback from every rank (mode, capture list, captured token
@@ -10,27 +11,27 @@ file is derived from it and adds exactly three things:
   3. an optional probe (CGPROBE=1) that counts real `CUDAGraph.replay()` calls and records
      what `cudagraph_manager.dispatch` actually returned for the timed forward.
 
-⚠️⚠️ WITHOUT (1) A "GRAPH" BOOT SILENTLY RUNS EAGER AT THE BENCHMARK SHAPE. vllm.py:1918
+WITHOUT (1) A "GRAPH" BOOT SILENTLY RUNS EAGER AT THE BENCHMARK SHAPE. vllm.py:1918
 defaults `max_cudagraph_capture_size` to 512 (1024 on Blackwell), and the auto size list is
 `[1,2,4] + range(8,256,8) + range(256,max+1,16)` = 51 entries topping out at 512. An
 8192-token prefill then misses every candidate and `CudaGraphManager.dispatch` returns
 `cg_mode=NONE` (cudagraph_utils.py:407) with no warning. Proving `cudagraph_mode=PIECEWISE`
 is NOT proving the measured shape replayed a graph, which is why (2) and (3) exist.
 
-⚠️ THE CAPTURE SIZE IS THE GLOBAL TOKEN COUNT, NOT THE PER-RANK SHARD. Under PCP the
+THE CAPTURE SIZE IS THE GLOBAL TOKEN COUNT, NOT THE PER-RANK SHARD. Under PCP the
 descriptor is chosen in `dispatch_cg_and_sync_dp` before `maybe_partition_pcp_batch` runs
 (model_runner.py:1109 sets num_tokens_after_padding from batch_desc, the PCP split happens at
 line 1301), so a T=8192 request needs 8192 in the list even though each rank then computes
 1024 tokens.
 
-⚠️ An explicitly supplied size list is filtered by `i <= max_num_batched_tokens`
+An explicitly supplied size list is filtered by `i <= max_num_batched_tokens`
 (vllm.py:1944), and this harness sets `max_num_batched_tokens=TOKENS`, so TOKENS itself is the
 largest legal capture size. Anything above it is dropped SILENTLY.
 
-⚠️ CGPROBE adds host work to the timed path, so it is for evidence boots only. Timing
+CGPROBE adds host work to the timed path, so it is for evidence boots only. Timing
 campaigns must run with CGPROBE unset.
 
-★★ CGCUSTOM EXISTS BECAUSE A GRAPH BOOT SILENTLY SWAPS THE ACTIVATION KERNEL, AND THAT SWAP
+CGCUSTOM EXISTS BECAUSE A GRAPH BOOT SILENTLY SWAPS THE ACTIVATION KERNEL, AND THAT SWAP
 CRASHES CAPTURE. vllm.py:1376-1382 appends the base mode `none` to `custom_ops` whenever the
 backend is inductor and the mode is not NONE, and `all` otherwise. So an eager boot runs
 `SiluAndMul.forward_cuda` (torch.ops._C.silu_and_mul) while a graph boot runs
@@ -50,7 +51,7 @@ backend is inductor and the mode is not NONE, and `all` otherwise. So an eager b
      `cudaErrorStreamCaptureInvalidated`. The primary error is the autotune sync, NOT the
      all2all backend.
 
-⚠️ THE INVALIDATED-CAPTURE ERROR IS A SYMPTOM TWICE OVER. `cudaErrorStreamCaptureInvalidated`
+THE INVALIDATED-CAPTURE ERROR IS A SYMPTOM TWICE OVER. `cudaErrorStreamCaptureInvalidated`
 is what the driver reports for every subsequent call once any capture has been poisoned, so it
 names neither the offending op nor the backend. Always read upstream to the FIRST exception.
 
@@ -73,7 +74,7 @@ env:
             op named here runs OUTSIDE the captured region. This is the second candidate graph
             fix for DeepEP HT: instead of removing the dispatch's host sync with
             num_worst_tokens, leave the sync alone and put the whole MoE outside the graph.
-            ⚠️ The default is `CompilationConfig._attention_ops` and it is read from the class
+            The default is `CompilationConfig._attention_ops` and it is read from the class
             at runtime rather than hardcoded, because passing an explicit list suppresses
             set_splitting_ops_for_v1's own default (compilation.py:1156) and dropping the
             attention ops would silently change what is captured.
@@ -81,7 +82,7 @@ env:
   OUTLENS   decode ladder, e.g. "1 4 8 16". Unset = the single OUTTOK width, unchanged.
             Every width runs REPS times inside ONE process, because the process is the unit of
             variance here and a slope assembled across boots would carry boot drift.
-            ⚠️ TPOT MUST BE TAKEN FROM A LATER-TOKEN INTERVAL. (D_hi - D_lo) / (hi - lo) with
+            TPOT MUST BE TAKEN FROM A LATER-TOKEN INTERVAL. (D_hi - D_lo) / (hi - lo) with
             lo=1 is anchored on the prefill pedestal: at T=8192 that pedestal is ~350 ms against
             a D16-D8 window of ~70 ms, so a 1% pedestal error moves the slope by ~5%, and with
             lo=1 the leverage is worse still. Use (D16-D8)/8 and cross-check (D8-D4)/4.
@@ -157,7 +158,7 @@ def cg_evidence(self):
         # out. `_attention_ops` is a ClassVar, so a mismatch here would mean the tree changed.
         "splitting_ops_n": len(cc.splitting_ops or []),
         "splitting_ops_moe": [o for o in (cc.splitting_ops or []) if "moe" in o],
-        # ⚠️ THE ALLOCATOR IS PART OF THE CONFIGURATION, SO IT IS READ BACK PER WORKER RATHER
+        # THE ALLOCATOR IS PART OF THE CONFIGURATION, SO IT IS READ BACK PER WORKER RATHER
         # THAN ASSUMED FROM THE LAUNCHING SHELL. expandable_segments changes the profile-run
         # peak, so an arm that had it and an arm that did not would differ in a second place.
         # This field is what proves every arm of a campaign shared one allocator setting.
@@ -208,7 +209,7 @@ def read_probe(self):
     mr = getattr(self, "model_runner", None)
     cgm = getattr(mr, "cudagraph_manager", None) if mr is not None else None
     log = getattr(cgm, "_ep_log", []) if cgm is not None else []
-    # ⚠️ `ndisp` AND THE PER-REP CALL EXIST BECAUSE A POOLED REPLAY TOTAL HID THE REAL DEFECT.
+    # `ndisp` AND THE PER-REP CALL EXIST BECAUSE A POOLED REPLAY TOTAL HID THE REAL DEFECT.
     # MEASURED: a 6-rep graph boot reported 310 replays and a 3-rep boot reported 186, and
     # 310 = 62 x 5 while 186 = 62 x 3. So one of the six forwards replayed NOTHING, and it was
     # that forward which returned the wrong token. A tail of four dispatch entries could not
@@ -239,9 +240,11 @@ def main():
 
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    # ⚠️ Byte identical to ep_pcp_run.py's build_prompt, including add_special_tokens=False.
+    # Byte identical to ep_pcp_run.py's build_prompt, including add_special_tokens=False.
     # A different tokenization would be a different workload and would void the comparison
-    # against the shipping 316.1 / 631.0 ms eager anchors.
+    # against the 316.1 / 631.0 ms eager anchors. Those anchors are this validation's own
+    # basis and NOT the DeepSeek EP result: they were taken at a different DeepEP buffer
+    # size, so their absolute milliseconds are not comparable with the reported campaign.
     ids = tok(open(DATASET).read(), add_special_tokens=False)["input_ids"]
     while len(ids) < TOKENS:
         ids = ids + ids
@@ -261,7 +264,7 @@ def main():
         from vllm.config import CompilationConfig
         sizes = [int(s) for s in CGSIZES.split(",") if s.strip()] or [TOKENS]
         ckw = {}
-        # ⚠️ Do NOT pass a base mode here. vllm.py:1376 appends `none` or `all` itself and
+        # Do NOT pass a base mode here. vllm.py:1376 appends `none` or `all` itself and
         # is_custom_op_enabled raises if it sees two, so only the +/- directives go in.
         cops = [s.strip() for s in CGCUSTOM.split(",") if s.strip() and s.strip() != "-"]
         if cops:
@@ -278,7 +281,7 @@ def main():
                 k.strip(): _v(v.strip())
                 for k, v in (e.split("=", 1) for e in CGIND.split(",") if e.strip())}
         if CGSPLIT:
-            # ⚠️ THE ATTENTION OPS ARE RE-ADDED BY HAND BECAUSE AN EXPLICIT LIST REPLACES THE
+            # THE ATTENTION OPS ARE RE-ADDED BY HAND BECAUSE AN EXPLICIT LIST REPLACES THE
             # DEFAULT RATHER THAN EXTENDING IT. set_splitting_ops_for_v1 (compilation.py:1156)
             # assigns `list(self._attention_ops)` only when splitting_ops is None, so passing
             # ["vllm::moe_forward_shared"] alone would put attention back INSIDE the graph and
@@ -306,7 +309,7 @@ def main():
     # process. The process is the unit of variance in this family, so taking D16 from one boot
     # and D8 from another would put between-boot drift straight into the slope.
     #
-    # ⚠️ THE LEGACY `rep=` LINE IS EMITTED ONLY FOR outlen == 1, and unchanged. read_camp.py's
+    # THE LEGACY `rep=` LINE IS EMITTED ONLY FOR outlen == 1, and unchanged. read_camp.py's
     # regex ends in `(.*)$`, so appending a field to that line would be swallowed into
     # first_token. The multi-width path therefore uses its own `drep=` line, and a decode boot
     # stays readable as a TTFT boot by the existing reader at no cost.

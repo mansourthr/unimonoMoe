@@ -17,4 +17,10 @@ here are archived as-is and will not run without those paths restored.
 | `kernel_diffs/qwen_ep.diff` | The Qwen EP kernel as a diff against its TP parent. The fastest way to see only what EP changed. |
 | `kernel_diffs/ds3_ep.diff` | The same for DeepSeek-V3. |
 | `d1_ds3.sh` | The DeepSeek EP monokernel campaign runner used for that experiment. Superseded by `benchmarks/c2_camp.sh`. |
-| `superseded/acc_final.py` | An early single-GPU correctness harness against an fp64 oracle. Superseded by `validation/ep4_acc.py` and `validation/ds3_acc.py`. Its docstring is worth reading: it records why synthetic weights gave a false failure. |
+| `ds3_acc.py` | The correctness gate for that same experiment: the DeepSeek EP persistent kernel against an fp64 oracle and a full-width non-EP control, ranks in sequence. It is here and not in `validation/` because it gates the archived kernel, not the shipped DeepSeek EP path. The gate for the shipped path is `validation/ep_silu_gate.py`. |
+| `superseded/acc_final.py` | An early single-GPU correctness harness against an fp64 oracle. Superseded by `validation/ep4_acc.py` and `ds3_acc.py` above. Its docstring is worth reading: it records why synthetic weights gave a false failure. |
+
+The two reports are working research logs written while the experiments were running,
+not cleaned-up write-ups. They discuss what to present and what to drop, they name
+intermediate arms that no result depends on, and their conclusions are what the final
+numbers were taken from. They are kept as written.
